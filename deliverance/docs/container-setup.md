@@ -59,6 +59,22 @@ For a fresh checkout, run these commands in order. If `.venv` already exists fro
 
 For a fresh Mixtral conversion, use the [inference guide](moe-inference.md) after conversion and pass the tokenizer explicitly (`--tokenizer-type Llama2Tokenizer --tokenizer-model /models/mistralai/.Mixtral-8x7B-v0.1.incoming/tokenizer.model`). The legacy Mixtral converter's version check rejects Transformers 5.x; use `uv pip install --python .venv/bin/python 'transformers==4.57.6'` before running that converter.
 
+Model Conversion steps (For tp8)
+```bash
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+
+python tools/checkpoint/convert.py \
+  --model-type GPT \
+  --loader mixtral_hf \
+  --saver core \
+  --load-dir /models/mistralai/.Mixtral-8x7B-v0.1.incoming \
+  --save-dir /models/mixtral-8x7b-tp8-pp1-ep1 \
+  --tokenizer-model /models/mistralai/.Mixtral-8x7B-v0.1.incoming/tokenizer.model \
+  --target-tensor-parallel-size 8 \
+  --target-pipeline-parallel-size 1 \
+  --target-expert-parallel-size 1
+  ```
+
 ## Reusing the environment
 
 The checkout is bind-mounted, so `.venv` survives stopping and recreating the container. On each new start, run `cd /workspace/deliverance` and `source .venv/bin/activate`. Create a new venv only if the checkout/venv was removed, the base image or Python version changes incompatibly, or the environment is broken and cannot be repaired. Do **not** recreate it merely because the container was restarted.
