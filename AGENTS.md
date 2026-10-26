@@ -1,3 +1,8 @@
+# Deliverance Guidelines
+
+For the forked  upstream:  github.com/stygianet/deliverance, refer to the CLAUDE.md in `<MEGATRON_ROOT>/deliverance/CLAUDE.md`
+
+The majority of #Repository-Guidelines in this document referring to Nvidia's upstream should be respected loosely in order to allow a future merge.
 # Repository Guidelines
 
 ## Skills

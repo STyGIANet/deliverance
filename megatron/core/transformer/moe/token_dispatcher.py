@@ -960,6 +960,26 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         return tokens_per_expert
 
 
+class MoEDecomposedAlltoAllDispatcher(MoEAlltoAllTokenDispatcher):
+    def __init__(
+            self, num_local_experts: int, 
+            local_expert_indices: List[int], 
+            config: TransformerConfig, 
+            pg_collection: ProcessGroupCollection | None = None
+        ) -> None:
+
+        super().__init__(
+            num_local_experts, 
+            local_expert_indices, 
+            config, 
+            pg_collection
+        )
+
+        # Our initialisations
+        # s_disp = torch.cuda.stream(device="cuda")
+        
+        
+
 class _DispatchManager(ABC):
     """
     A manager class to handle dispatch and combine processes for MoE models.
