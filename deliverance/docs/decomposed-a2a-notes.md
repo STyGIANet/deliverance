@@ -287,6 +287,11 @@ SYS (through UPI).
 - **Buffers:** preallocate recv/out buffers across layers.
 - **Shared experts:** overlap with matching-1 dispatch (Mixtral has none; relevant for DeepSeek).
 
+## Timing
+
+Per-phase timing (stock vs decomposed, overlap metrics) is specified in
+[moe-timing.md](moe-timing.md).
+
 ## Training (later)
 
 Backward of dispatch = combine with the same matchings, and vice versa. Needs a custom
