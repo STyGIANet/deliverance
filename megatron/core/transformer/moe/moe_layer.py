@@ -15,6 +15,7 @@ from megatron.core.inference.moe.flashinfer_mxfp8 import require_flashinfer_rout
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.moe.moe_timing import get_moe_phase_timer, moe_phase
 from megatron.core.transformer.moe.moe_utils import (
     MoECudaGraphPartialCaptureSignal,
     MoECudaGraphTensorStore,
@@ -705,13 +706,33 @@ class MoELayer(BaseMoELayer):
                 self.token_dispatcher = self._training_token_dispatcher
                 self.shared_expert_overlap = self.config.moe_shared_expert_overlap
 
+        # Per-phase timing (MOE_PHASE_TIMING_DIR). Only whole forward passes are timed: partial
+        # CUDA-graph execution and recompute would produce incomplete or duplicate records.
+        timer = get_moe_phase_timer()
+        timed = (
+            timer is not None
+            and intermediate_tensors is None
+            and not (self.moe_layer_recompute and self.training)
+        )
+
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
+            timing = (
+                timer.begin_layer(
+                    layer=self.layer_number if self.layer_number is not None else -1,
+                    path=type(self.token_dispatcher).__name__,
+                    n_tokens_local=hidden_states.numel() // hidden_states.shape[-1],
+                )
+                if timed
+                else None
+            )
             try:
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
-                    probs, routing_map = self.route(hidden_states, padding_mask, input_ids)
-                    hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
+                    with moe_phase(timing, "route"):
+                        probs, routing_map = self.route(hidden_states, padding_mask, input_ids)
+                    with moe_phase(timing, "pre"):
+                        hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
 
                     if intermediate_tensors is not None:
                         return hidden_states, probs, shared_expert_output
@@ -728,12 +749,19 @@ class MoELayer(BaseMoELayer):
                 if intermediate_tensors is not None:
                     hidden_states, probs = intermediate_tensors
 
-                dispatched_input, probs = self.dispatch(hidden_states, probs)
-                output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
+                with moe_phase(timing, "dispatch") as interval:
+                    dispatched_input, probs = self.dispatch(hidden_states, probs)
+                    interval.tokens = dispatched_input.shape[0]
+                if timing is not None:
+                    timing.n_tokens_recv = dispatched_input.shape[0]
+                with moe_phase(timing, "compute", tokens=dispatched_input.shape[0]):
+                    output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
                 assert (
                     mlp_bias is None
                 ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
-                output = self.combine(output)
+                with moe_phase(timing, "combine") as interval:
+                    output = self.combine(output)
+                    interval.tokens = output.shape[0]
 
                 if intermediate_tensors is not None:
                     return output, mlp_bias
@@ -742,11 +770,14 @@ class MoELayer(BaseMoELayer):
                 if intermediate_tensors is not None:
                     output, shared_expert_output = intermediate_tensors
 
-                output = self.postprocess(output, shared_expert_output)
+                with moe_phase(timing, "post"):
+                    output = self.postprocess(output, shared_expert_output)
 
                 if intermediate_tensors is not None:
                     return output
 
+            if timing is not None:
+                timing.timer.end_layer(timing)
             return output, mlp_bias
 
         if self.moe_layer_recompute and self.training:

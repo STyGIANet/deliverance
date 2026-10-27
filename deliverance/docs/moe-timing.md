@@ -16,6 +16,109 @@ quantified. Design notes for the dispatcher itself: [decomposed-a2a-notes.md](de
 | Off by default; enabled by env var `MOE_PHASE_TIMING_DIR` (set = on, value = per-rank output dir) | Agreed |
 | No inference-engine plumbing. The timer derives step boundaries itself and buckets by token count instead of step type | Agreed |
 
+## Usage
+
+All paths are relative to `<MEGATRON_ROOT>`. Run every command from there with the venv active:
+
+```bash
+cd <MEGATRON_ROOT>
+source .venv/bin/activate
+```
+
+### Enable timing on a run
+
+Set `MOE_PHASE_TIMING_DIR` to a **fresh** directory. `torch.distributed.run` passes it to every
+rank, and each rank writes `rank<NNNNN>.jsonl` there. The launcher's `--timing-dir` sets it for you
+(and refuses a directory that already has rank files):
+
+```bash
+bash deliverance/scripts/run_moe_inference.sh \
+  --model mistralai/Mixtral-8x7B-v0.1 --dataset gsm8k --samples 2 --max-new-tokens 8 \
+  --timing-dir local/moe-timing/$(date +%Y%m%d-%H%M%S)
+```
+
+Leave the variable unset to run without timing (zero overhead apart from one env lookup). If the
+directory already contains a `rank<NNNNN>.jsonl`, the run stops with `FileExistsError` instead of
+overwriting it.
+
+Verified end-to-end on 2026-10-27: Mixtral 8×7B, legacy TP=4 checkpoint, `--parallelism dp`
+(TP=4, DP=2, EP=1), 4 gsm8k prompts, 8 new tokens. All 8 ranks wrote 608 rows (19 steps × 32
+layers), every row with all six phases. Generated text was identical to earlier runs without
+the timer.
+
+```bash
+# The run above (TP=4, DP=2, EP=1), with the current launcher:
+bash deliverance/scripts/run_moe_inference.sh \
+  --model mixtral-8x7b-tp4-pp1-ep1 --tp 4 --ep 1 --dataset gsm8k --samples 4 --max-new-tokens 8 \
+  --timing-dir local/moe-timing/$(date +%Y%m%d-%H%M%S) \
+  --tokenizer-type Llama2Tokenizer \
+  --tokenizer-model /depot/shared/.cache/huggingface/hub/models--mistralai--Mixtral-8x7B-v0.1/snapshots/fc7ac94680e38d7348cfa806e51218e6273104b0/tokenizer.model
+```
+
+Also verified on 2026-10-27 at the default TP=1, PP=1, EP=8 (`--model mistralai/Mixtral-8x7B-v0.1`,
+same prompts): all 8 ranks wrote 608 rows with all six phases on `MoEAlltoAllTokenDispatcher`, and
+`n_tokens_recv` varied per rank as expected under EP. `--timing-dir` sets `MOE_PHASE_TIMING_DIR`.
+
+### Inspect the output
+
+Until the analysis script exists, this prints per-phase durations for the first rows of rank 0:
+
+```bash
+python - <<'EOF'
+import json
+path = "local/moe-timing/<run>/rank00000.jsonl"
+for line in list(open(path))[:5]:
+    r = json.loads(line)
+    phases = ", ".join(f"{i['phase']}={i['end_us'] - i['start_us']:.1f}us" for i in r["intervals"])
+    T = max(i["end_us"] for i in r["intervals"])
+    print(f"step={r['step']} layer={r['layer']} N={r['n_tokens_local']} T={T:.1f}us | {phases}")
+EOF
+```
+
+### Smoke test (unit tests)
+
+Timer tests on one GPU (about 1 s):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python -m torch.distributed.run --nproc-per-node 1 \
+  -m pytest -q -p no:cacheprovider tests/unit_tests/transformer/moe/test_moe_timing.py
+```
+
+Expected: `6 passed`.
+
+Regression check against the existing MoE layer tests (timing off by default, so outcomes must
+match a run without the hooks):
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.run --nproc-per-node 4 \
+  -m pytest -q -p no:cacheprovider \
+  tests/unit_tests/transformer/moe/test_moe_layer.py \
+  tests/unit_tests/transformer/moe/test_moe_timing.py
+```
+
+Expected on 4 GPUs: `20 failed, 49 passed, 8 skipped`. All 20 failures are
+`world_size (4) is not divisible by ... (8)`. Those cases need `--nproc-per-node 8`.
+
+To reproduce the baseline comparison:
+
+```bash
+git stash push -m "moe-timing hooks" -- megatron/core/transformer/moe/moe_layer.py
+# run the test_moe_layer.py command above (without test_moe_timing.py) -> 20 failed, 43 passed, 8 skipped
+git stash pop
+```
+
+Requires the `test` dependency group (`uv pip install --group test`). `install.sh` does not
+install it.
+
+### Formatting
+
+isort/black are not in the venv. Run them ephemerally at the versions pinned in `pyproject.toml`:
+
+```bash
+uvx isort==5.13.2 <files>
+uvx black==26.3.0 <files>
+```
+
 ## Mechanism
 
 - `torch.cuda.Event(enable_timing=True)` records a GPU timestamp when the stream reaches it.
@@ -27,8 +130,16 @@ quantified. Design notes for the dispatcher itself: [decomposed-a2a-notes.md](de
 - Resolution is lazy and non-blocking: at the start of a new step, resolve earlier steps whose
   last event reports `query() == True`, and keep the rest pending. A blocking final flush runs at
   shutdown.
-- NVTX ranges with the same tag names are emitted alongside, so Nsight Systems traces can
-  validate the event numbers. Nsight is for validation only, not the primary metric.
+- NVTX ranges (`moe.<phase>` / `moe.<phase>[idx]`) are emitted alongside, so Nsight Systems traces
+  can validate the event numbers. Nsight is for validation only, not the primary metric. They go
+  through Megatron's `nvtx_range_push/pop`, so they appear only when Megatron's NVTX profiling is
+  enabled (`configure_nvtx_profiling(True)`). NVTX ranges mark CPU issue time; Nsight maps them to
+  the GPU kernels.
+- The layer reference event is recorded at the top of `MoELayer.forward`, before the shared
+  experts and the router, so `T` covers the whole layer. Timing is skipped for partial CUDA-graph
+  passes (`intermediate_tensors`), during graph capture, and under MoE-layer recompute.
+- Output files are opened with mode `x`: an existing `rank<NNNNN>.jsonl` is never overwritten, and
+  the run fails fast with a message to use a fresh directory.
 
 ## What is recorded
 
@@ -38,6 +149,7 @@ Event pairs around the existing `MoELayer` methods:
 
 | Phase | Method |
 | --- | --- |
+| `route` | `route` (router) |
 | `pre` | `preprocess` (permute + metadata, incl. DtoH sync) |
 | `dispatch` | `dispatch` (EP A2A) |
 | `compute` | `routed_experts_compute` (`dispatch_postprocess` + `experts()` + `combine_preprocess`) |
@@ -58,7 +170,7 @@ Event pairs around the existing `MoELayer` methods:
 ### Record schema (one JSONL row per rank × step × layer)
 
 ```text
-{ rank, step, layer, path: "stock" | "decomposed",
+{ rank, step, layer, path,                  # path = dispatcher class name, e.g. "MoEAlltoAllTokenDispatcher"
   n_tokens_local, n_tokens_recv,             # bucket on these instead of step type
   schedule_cpu_us,                           # decomposed only
   intervals: [ { phase, idx, tokens, start_us, end_us } ... ]   # relative to layer reference event
@@ -87,6 +199,20 @@ information from the inference engine.
 
 ## Caveats
 
+Observed in the first real run (TP=4, EP=1):
+
+- **With TP>1, TP communication is counted in `compute`.** The stock path's TP all-gather
+  (`dispatch_postprocess`) and reduce-scatter (`combine_preprocess`) run inside
+  `routed_experts_compute`, so `dispatch`/`combine` only cover the EP all-to-all. At EP=1 they are
+  near zero (`combine` = 0 µs). Attribute phases accordingly when TP>1.
+- **Warmup:** steps 0 and 1 took 1.2 s and 124 ms per layer vs ~6.5 ms in steady state, so trim at
+  least the first 2 steps.
+- **Token counts look padded.** Decode steps with 2 live requests per replica reported
+  `n_tokens_local = 64`. The engine pads tokens per step; see the padding item in the notes
+  checklist. The mechanism isn't confirmed yet.
+- **Occasional `pre` spikes** (0.5 ms → 1.5–3 ms on some steps), consistent with the host sync in
+  `preprocess`. Not investigated.
+
 - **A transfer's measured duration includes waiting for its partner.** P2P kernels block until
   the partner arrives, so `dispatch[k]` = wait + transfer. Events alone cannot separate them.
   Report it as "stream occupied by transfer".
@@ -110,11 +236,13 @@ information from the inference engine.
 ## Checklist
 
 - [x] Decide how timing is enabled: env var `MOE_PHASE_TIMING_DIR`.
-- [ ] `moe_timing.py`: event pool, `mark(tag, stream)`, interval bookkeeping, lazy resolution,
-      local step counter, per-rank JSONL writer.
-- [ ] Hooks in the stock `MoELayer` phases.
+- [x] `moe_timing.py`: event pool, `moe_phase(record, name, idx, tokens)` context manager,
+      interval bookkeeping, lazy resolution, local step counter, per-rank JSONL writer.
+- [x] Hooks in the stock `MoELayer` phases.
+- [x] Unit tests: `tests/unit_tests/transformer/moe/test_moe_timing.py`.
 - [ ] Hooks inside `dispatch_compute_combine` (per matching / per batch) + `schedule_cpu`.
-- [ ] NVTX ranges with matching tags.
+- [x] NVTX ranges with matching tags.
+- [ ] Run `test_moe_layer.py` on all 8 GPUs (20 cases need world size 8; only checked on 4 so far).
 - [ ] Offline analysis script: metrics table + compute cost curve.
 - [ ] Validate against an Nsight Systems trace on a few steps.
 - [ ] Overhead check: stock path with timing on vs off.
