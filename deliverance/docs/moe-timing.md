@@ -12,7 +12,7 @@ quantified. Design notes for the dispatcher itself: [decomposed-a2a-notes.md](de
 | Log every layer of every step (no sampling) | Agreed |
 | Do not log `D` or the schedule (possible future extension) | Agreed |
 | Timer module lives in `megatron/core/transformer/moe/` (e.g. `moe_timing.py`) | Agreed |
-| Offline analysis script lives in `deliverance/scripts/` | Proposed |
+| Offline analysis script: `deliverance/scripts/analyse_moe_timing.py` | Done |
 | Off by default; enabled by env var `MOE_PHASE_TIMING_DIR` (set = on, value = per-rank output dir) | Agreed |
 | No inference-engine plumbing. The timer derives step boundaries itself and buckets by token count instead of step type | Agreed |
 
@@ -59,21 +59,26 @@ Also verified on 2026-10-27 at the default TP=1, PP=1, EP=8 (`--model mistralai/
 same prompts): all 8 ranks wrote 608 rows with all six phases on `MoEAlltoAllTokenDispatcher`, and
 `n_tokens_recv` varied per rank as expected under EP. `--timing-dir` sets `MOE_PHASE_TIMING_DIR`.
 
-### Inspect the output
-
-Until the analysis script exists, this prints per-phase durations for the first rows of rank 0:
+### Analyse a run
 
 ```bash
-python - <<'EOF'
-import json
-path = "local/moe-timing/<run>/rank00000.jsonl"
-for line in list(open(path))[:5]:
-    r = json.loads(line)
-    phases = ", ".join(f"{i['phase']}={i['end_us'] - i['start_us']:.1f}us" for i in r["intervals"])
-    T = max(i["end_us"] for i in r["intervals"])
-    print(f"step={r['step']} layer={r['layer']} N={r['n_tokens_local']} T={T:.1f}us | {phases}")
-EOF
+python deliverance/scripts/analyse_moe_timing.py local/moe-timing/<run>                  # drops steps < 5
+python deliverance/scripts/analyse_moe_timing.py local/moe-timing/<run> --warmup 0 --per-layer
+python deliverance/scripts/analyse_moe_timing.py local/moe-timing/<run> --csv local/<run>.csv
 ```
+
+It prints prefill and decode tables (see [Metrics](#metrics-offline)): makespan and
+exposed comm / exposed compute / overlapped / other for the critical rank (mean, p50, p99, max,
+% of makespan), the mean exposed comm over ranks, and per-phase sums. `--per-layer` adds mean
+makespan per layer, which shows where cold start sits. `--csv` writes one row per (step, layer).
+
+- **Step kind:** a step is decode if every rank's `n_tokens_local` ≤ `--decode-max-tokens`
+  (default 64, the padded decode size seen so far), else prefill.
+- **Warmup vs prefill:** in an offline run every prompt arrives at t = 0, so step 0 is the *only*
+  prefill step, and its first layers carry the cold start (Mixtral EP=8: layer 1 of step 0 took
+  1.3 s vs ~32 ms warm). The default `--warmup 5` therefore leaves no prefill samples, and
+  `--warmup 0` keeps prefill with the cold start included (use p50 or `--per-layer`). Doing a
+  warmup `generate` inside `offline_inference.py` would remove this trade-off. Not done yet.
 
 ### Smoke test (unit tests)
 
@@ -186,16 +191,48 @@ information from the inference engine.
 
 ## Metrics (offline)
 
+Per rank, per (step, layer), on that rank's clock (intervals on all streams share it):
+
+- `W = [start(route), end(post)]`, so `|W|` is the rank's layer makespan.
+- `C` = union of `compute` intervals (expert compute only).
+- `M` = union of `dispatch` and `combine` intervals.
+
 | Metric | Definition | Purpose |
 | --- | --- | --- |
-| `T` (makespan) | layer reference → end of `post`, main stream | Head-to-head vs stock |
-| `B_disp`, `B_comp`, `B_comb` | sum of interval durations per stage | Busy time per stage |
-| `S` (serial) | `B_disp + B_comp + B_comb` (+ `pre` + `post`) | Time with no overlap |
-| Hidden time | `S − T` | Absolute overlap gain |
-| Overlap efficiency | `(S − T) / (S − max(B))` | Share of hideable time actually hidden (1.0 = perfect) |
-| Exposed comm | time in the window where `s_comp` is idle (interval union) | The paper's "bubbles" |
-| Compute cost curve | `compute[b]` duration vs `tokens` | Measured Fig. 1: fixed cost `c`, the knee, and choice of τ |
-| Effective layer time | `max over ranks` of `T` | The next layer's A2A re-syncs ranks |
+| Makespan | `\|W\|` | Primary metric, head-to-head vs stock |
+| Exposed comm | `\|M \ C\|` | Communication with no expert compute under it: the paper's "bubbles" |
+| Exposed compute | `\|C \ M\|` | Compute with no communication under it |
+| Overlapped | `\|M ∩ C\|` | Communication hidden under compute |
+| Other | `\|W\| − \|M ∪ C\|` | `route`, `pre`, `post`, idle gaps. Not compute |
+| `pre`, `post` | their own durations | Side information only |
+| Compute cost curve | `compute[b]` duration vs `tokens` | Measured Fig. 1: fixed cost `c`, the knee, and choice of τ (later) |
+
+The four middle rows sum to `|W|`. For the stock path, overlapped = 0 and exposed comm =
+`dispatch + combine`.
+
+Across ranks there is **no shared clock** (each rank's offsets are from its own reference event):
+
+- **System makespan** for a (step, layer) = **max over ranks** of `|W|`. The layer's A2A re-syncs
+  ranks, so this approximates completion time.
+- Exposed/overlapped metrics are reported for the **critical rank** (the one with the max `|W|`),
+  plus the mean across ranks.
+
+Reporting: drop the first **K = 5** steps (warmup), then split **prefill vs decode** and give
+mean / p50 / p99 / max.
+
+> [!IMPORTANT]
+> **"Exposed comm" includes waiting, not just transfer.** A `dispatch`/`combine` interval spans
+> from the transfer's start event to its end event, which covers time blocked on the slowest peer.
+> That delay therefore *inflates the communication time* (and exposed comm), rather than
+> disappearing from it. That is the intended accounting for now. Separating wait from transfer is
+> a future extension.
+
+<!-- separate callouts -->
+
+> [!IMPORTANT]
+> **With TP > 1, `compute` contains TP communication.** The TP all-gather and reduce-scatter run
+> inside `routed_experts_compute`, so they count toward `C` (compute) and *reduce* apparent exposed
+> comm. Exposed-comm numbers are only clean at TP = 1. The analysis script repeats this on every run.
 
 ## Caveats
 
@@ -205,8 +242,8 @@ Observed in the first real run (TP=4, EP=1):
   (`dispatch_postprocess`) and reduce-scatter (`combine_preprocess`) run inside
   `routed_experts_compute`, so `dispatch`/`combine` only cover the EP all-to-all. At EP=1 they are
   near zero (`combine` = 0 µs). Attribute phases accordingly when TP>1.
-- **Warmup:** steps 0 and 1 took 1.2 s and 124 ms per layer vs ~6.5 ms in steady state, so trim at
-  least the first 2 steps.
+- **Warmup:** steps 0 and 1 took 1.2 s and 124 ms per layer vs ~6.5 ms in steady state. The
+  analysis drops the first 5 steps by default.
 - **Token counts look padded.** Decode steps with 2 live requests per replica reported
   `n_tokens_local = 64`. The engine pads tokens per step; see the padding item in the notes
   checklist. The mechanism isn't confirmed yet.
@@ -243,7 +280,10 @@ Observed in the first real run (TP=4, EP=1):
 - [ ] Hooks inside `dispatch_compute_combine` (per matching / per batch) + `schedule_cpu`.
 - [x] NVTX ranges with matching tags.
 - [ ] Run `test_moe_layer.py` on all 8 GPUs (20 cases need world size 8; only checked on 4 so far).
-- [ ] Offline analysis script: metrics table + compute cost curve.
+- [x] Offline analysis script: metrics table (`analyse_moe_timing.py`).
+- [ ] Compute cost curve (`compute[b]` duration vs tokens), once the decomposed path exists.
+- [ ] Decide on a real warmup in `offline_inference.py` (throw-away `generate`, record warmup step
+      count) so prefill can be measured without cold start.
 - [ ] Validate against an Nsight Systems trace on a few steps.
 - [ ] Overhead check: stock path with timing on vs off.
 

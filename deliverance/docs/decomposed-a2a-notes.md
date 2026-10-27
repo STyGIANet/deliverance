@@ -255,6 +255,15 @@ MoELayer.forward:
     postprocess (combine_postprocess)
 ```
 
+> [!WARNING]
+> **OBSERVE LATER — where the timing events are recorded decides what "exposed comm" means.**
+> Record each `compute[b]` start event **after** `s_comp.wait(ev_disp[...])`, and each `combine[k]`
+> start event **after** `s_comb.wait(ev_comp[...])`. If the start event is recorded before the
+> wait, the interval includes the stream idling for its input. That inflates compute (`C`), hides
+> exposed comm, and makes the decomposition look better than it is.
+> When results come in, check this first if exposed comm looks suspiciously low. Also check one
+> layer against an Nsight trace.
+
 Invariants:
 
 - No host sync inside the three loops. All splits and `tpe` are already on the CPU.
@@ -340,8 +349,13 @@ Consequences and caveats:
 
 ## Timing
 
-Per-phase timing (stock vs decomposed, overlap metrics) is specified in
-[moe-timing.md](moe-timing.md).
+Per-phase timing (stock vs decomposed, exposed comm/compute) is specified in
+[moe-timing.md](moe-timing.md). Before reading results, remember:
+
+- **Exposed comm includes waiting on the slowest peer** (it inflates comm time). See moe-timing.md.
+- **TP > 1 puts TP communication inside `compute`.** Exposed comm is only clean at TP = 1.
+- **Event placement in the decomposed dispatcher:** see the OBSERVE LATER warning above the
+  pseudocode invariants.
 
 ## Training (later)
 
