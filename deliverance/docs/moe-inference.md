@@ -1,29 +1,96 @@
 # Eight-GPU MoE inference
 
-First-time container setup: [container-setup.md](container-setup.md).
+Run from `<MEGATRON_ROOT>` with the venv activated (`source .venv/bin/activate`). The venv's
+`activate` sets the shared roots (see [install.md](install.md)).
 
-Run these commands **inside the container**, from the activated Python environment. Mount shared datasets at `/datasets` and converted Megatron checkpoints at `/models` (or keep a checkpoint in `models/` under the checkout).
+## Quick start
 
 ```bash
-cd /workspace/deliverance
-source .venv/bin/activate
+# Default: TP=1, PP=1, EP=8 on 8 GPUs. Downloads and converts the model on first use.
 bash deliverance/scripts/run_moe_inference.sh \
-  --model models/mixtral-8x7b-tp4-pp1-ep1 \
-  --dataset gsm8k \
-  --parallelism dp \
-  --samples 2 \
-  --max-new-tokens 8 \
-  --tokenizer-type Llama2Tokenizer \
-  --tokenizer-model /models/mistralai/.Mixtral-8x7B-v0.1.incoming/tokenizer.model \
-  --dry-run
+  --model mistralai/Mixtral-8x7B-v0.1 --dataset gsm8k --samples 4 --max-new-tokens 8
+
+# Same, with MoE phase timing (see moe-timing.md)
+bash deliverance/scripts/run_moe_inference.sh \
+  --model mistralai/Mixtral-8x7B-v0.1 --dataset gsm8k --samples 4 --max-new-tokens 8 \
+  --timing-dir local/moe-timing/$(date +%Y%m%d-%H%M%S)
 ```
 
-Remove `--dry-run` to launch. The launcher accepts a model directory name under `/models` or a checkpoint path. It accepts a dataset name under `/datasets/moe-inference-datasets` or a path to a JSONL file with a `text` field on each line. Available names are `gsm8k`, `ifeval`, `mtbench`, `qasper`, `mixed_short_long`, and `mixed_length_sorted`.
+Add `--dry-run` to print what would run, including any download or conversion, without doing it.
+`--help` lists every option.
 
-`--parallelism tp` shards one model across eight GPUs (TP=8, DP=1). `--parallelism dp` reads the TP size from a **legacy** checkpoint's shard directories and uses the remaining GPUs for data-parallel replicas: TP=4 becomes DP=2, TP=2 becomes DP=4, and TP=1 becomes DP=8. A TP=8 checkpoint cannot provide DP replicas. For distributed checkpoints, specify `--tp-size 1`, `2`, or `4` with `--parallelism dp`; the directory layout does not reliably expose the saved TP size. Both modes use PP=1 and EP=1. Coordinator mode routes prompts across DP replicas, so results are written once. These modes do not measure pipeline-parallel bubbles.
+## Model resolution
 
-The script checks that legacy checkpoint shards match the requested topology. It also blocks a multi-replica legacy run when the estimated checkpoint load exceeds 80% of available host RAM. This is a conservative CPU-memory check, not a GPU-memory guarantee; use `--skip-memory-check` only if you accept the OOM risk. The TP=1 Mixtral checkpoint with DP=8 previously OOM-killed a worker on this machine.
+`--model` is resolved in this order:
 
-The default output is a timestamped JSON file under `local/moe-inference-results/`. Use `--output PATH` to choose another location; an existing file is never overwritten. `--max-new-tokens`, `--max-seq-length`, and `--kv-cache-gb` tune generation and GPU memory use. Run `bash deliverance/scripts/run_moe_inference.sh --help` for all options.
+1. **A path** to a Megatron checkpoint directory.
+2. **A checkpoint name** under `DELIVERANCE_CKPT_ROOT` (default
+   `/depot/shared/megatron-checkpoints`), e.g. `mixtral-8x7b-tp4-pp1-ep1`.
+3. **A Hugging Face repo ID** (`org/name`). The launcher uses
+   `<ckpt_root>/<lowercased name>-tp<T>-pp<P>-ep<E>`. If that does not exist, it runs
+   [`prepare_checkpoint.sh`](#preparing-checkpoints) first, then launches inference.
 
-Hugging Face safetensors are **not** Megatron checkpoints. The shared `/srv/deliverance/models/mistralai/.Mixtral-8x7B-v0.1.incoming` directory contains HF-format weights and cannot be passed directly to this script; convert a model to a Megatron checkpoint first.
+Routes 1 and 2 never convert. Hugging Face safetensors directories are rejected; pass the
+repo ID instead.
+
+## Parallelism
+
+`--tp`, `--pp` and `--ep` default to 1, 1 and 8; `--gpus` defaults to 8.
+
+Legacy (`torch` format) checkpoints cannot be resharded while loading, so their shard directories
+(`mp_rank_TT[_PPP][_EEE]`) must match the requested TP/PP/EP exactly; the launcher checks this before
+starting. To run another layout from HF, pass the repo ID with the new sizes and it converts a
+matching checkpoint. The older EP=1 checkpoints (`mixtral-8x7b-tp{1,4,8}-pp1-ep1`) need `--ep 1` and
+the matching `--tp`.
+
+## Tokenizer
+
+Checkpoints made by `prepare_checkpoint.sh` contain `deliverance_source.json` recording the HF repo,
+revision and tokenizer. The launcher uses it automatically; the converter itself stores no
+tokenizer path. For the older EP=1 checkpoints, whose stored tokenizer path points into a
+container, pass it explicitly:
+
+```bash
+  --tokenizer-type Llama2Tokenizer \
+  --tokenizer-model /depot/shared/.cache/huggingface/hub/models--mistralai--Mixtral-8x7B-v0.1/snapshots/fc7ac94680e38d7348cfa806e51218e6273104b0/tokenizer.model
+```
+
+## Pinned settings and pass-through
+
+The launcher passes `--transformer-impl transformer_engine` and `--moe-token-dispatcher-type`
+(`--dispatcher`, default `alltoall`) explicitly so runs compare the same layer implementation;
+`--use-checkpoint-args` does not override either. Anything after `--` goes to Megatron unchanged.
+
+## Outputs
+
+- Results JSON: `local/moe-inference-results/<timestamp>.json` by default, or `--output PATH`. An
+  existing file is never overwritten.
+- `<output>.manifest.json`: command, git commit/branch/dirty flag, model resolution, parallelism,
+  package versions and `CUDA_*`/`NCCL_*`/`MOE_*`/`DELIVERANCE_*`/`TORCH_*`/`NVTE_*` environment.
+- `<output>.diff`: `git diff HEAD` when the tree has uncommitted tracked changes.
+
+## Preparing checkpoints
+
+`deliverance/scripts/prepare_checkpoint.sh` is what the launcher calls; it can also run alone:
+
+```bash
+bash deliverance/scripts/prepare_checkpoint.sh --hf-repo mistralai/Mixtral-8x7B-v0.1 --tp 1 --pp 1 --ep 8 --dry-run
+```
+
+1. Downloads the repo into the shared HF hub cache (`HF_HUB_CACHE`) unless the cached snapshot
+   already has every shard. `--hf-dir PATH` uses an existing local copy instead.
+2. Converts with `tools/checkpoint/convert.py` (`mixtral_hf` loader, `core` saver) into
+   `<ckpt_root>/<name>-tp<T>-pp<P>-ep<E>.incoming`, verifies every shard (the converter ignores the
+   saver's exit status), writes `deliverance_source.json`, then renames it into place.
+
+Constraints:
+
+- Only Mixtral: it is the only HF MoE loader in `tools/checkpoint`.
+- The loader needs **transformers 4.x ≥ 4.36** (4.57.6 is known good; transformers 5 fused the
+  expert weights and renamed the MoE block). The script checks but never changes the venv. Note
+  `uv sync` restores the locked 5.x.
+- With EP > 1 every shard holds a full copy of the attention and embedding weights (the legacy
+  format writes each rank's complete state dict), so EP=8 Mixtral is 108 GB on disk versus 87 GB.
+
+Verified on 2026-10-27: Mixtral EP=8 conversion, then a 4-prompt gsm8k run produced token IDs
+identical to the TP=4/EP=1 checkpoint, with 608 timing rows per rank.

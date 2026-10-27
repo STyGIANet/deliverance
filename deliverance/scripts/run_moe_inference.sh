@@ -1,42 +1,58 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Run the fork's offline inference example on all eight local GPUs.
+# Run the fork's offline inference example on the local GPUs, preparing the
+# Megatron checkpoint from Hugging Face first when needed.
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-model_root="${DELIVERANCE_MODEL_ROOT:-/models}"
-dataset_root="${DELIVERANCE_DATASET_ROOT:-/datasets/moe-inference-datasets}"
-gpu_count=8
+# DELIVERANCE_MODEL_ROOT is the older name for the checkpoint root.
+ckpt_root="${DELIVERANCE_CKPT_ROOT:-${DELIVERANCE_MODEL_ROOT:-/depot/shared/megatron-checkpoints}}"
+dataset_root="${DELIVERANCE_DATASET_ROOT:-/depot/shared/datasets/moe-inference-datasets}"
 
 usage() {
   cat <<'EOF'
-Usage: run_moe_inference.sh --model NAME_OR_PATH --dataset NAME_OR_PATH [options]
+Usage: run_moe_inference.sh --model MODEL --dataset NAME_OR_PATH [options] [-- MEGATRON_ARGS...]
 
 Required:
-  --model PATH|NAME       Megatron checkpoint directory; names resolve under /models
-  --dataset PATH|NAME     JSONL prompt file; names resolve under /datasets/moe-inference-datasets
+  --model MODEL           One of, in lookup order:
+                            - a Megatron checkpoint directory path
+                            - a checkpoint name under $DELIVERANCE_CKPT_ROOT
+                            - a Hugging Face repo ID (org/name): uses
+                              <ckpt_root>/<name>-tp<T>-pp<P>-ep<E>, downloading
+                              and converting it with prepare_checkpoint.sh first
+                              if it does not exist
+  --dataset PATH|NAME     JSONL prompt file; names resolve under $DELIVERANCE_DATASET_ROOT
+
+Parallelism:
+  --tp N                  Tensor parallel size (default: 1)
+  --pp N                  Pipeline parallel size (default: 1)
+  --ep N                  Expert parallel size (default: 8)
+  --gpus N                GPUs / processes on this node (default: 8)
 
 Options:
-  --parallelism tp|dp     TP=8, DP=1 (default), or use checkpoint TP with DP
-  --tp-size N             DP mode: specify TP for a distributed checkpoint
+  --dispatcher TYPE       MoE token dispatcher (default: alltoall)
+  --timing-dir DIR        Enable MoE phase timing, writing rank*.jsonl to DIR
   --output PATH           Results JSON (default: local/moe-inference-results/<timestamp>.json)
-  --tokenizer-model PATH  Override the tokenizer path saved in the checkpoint
-  --tokenizer-type TYPE   Tokenizer type for the override (default: HuggingFaceTokenizer)
+  --tokenizer-model PATH  Tokenizer file; defaults to the one recorded by
+                          prepare_checkpoint.sh, otherwise the checkpoint's own
+  --tokenizer-type TYPE   Tokenizer type for --tokenizer-model (default: Llama2Tokenizer)
   --precision bf16|fp16   Compute precision (default: bf16)
   --samples N             Use only the first N prompts
   --max-new-tokens N      Tokens generated per prompt (default: 64)
   --max-seq-length N      Prompt + generation token limit (default: 4096)
   --kv-cache-gb N         GPU KV cache per rank in GiB (default: 4)
-  --skip-memory-check     Bypass the legacy-checkpoint host RAM safety check
-  --dry-run               Print the command without launching GPUs
+  --dry-run               Print what would run (including any download or
+                          conversion) without doing it
   -h, --help              Show this help
+
+Arguments after `--` are passed to Megatron unchanged.
+
+Each run writes <output>.manifest.json next to the results (command, git
+commit, dirty flag, environment) and <output>.diff when the tree is dirty.
 
 Dataset names: gsm8k, ifeval, mtbench, qasper, mixed_short_long,
                mixed_length_sorted. A custom JSONL path also works.
-Override roots with DELIVERANCE_MODEL_ROOT and DELIVERANCE_DATASET_ROOT.
-For legacy checkpoints, DP mode reads the TP size from checkpoint shards:
-TP=4 gives DP=2; TP=2 gives DP=4; TP=1 gives DP=8.
-Distributed checkpoints need --tp-size because their TP layout is not
-reliably inferable from directory names.
+Legacy (torch format) checkpoints cannot be resharded while loading, so their
+shard layout must match --tp/--pp/--ep.
 EOF
 }
 
@@ -59,8 +75,12 @@ positive_integer() {
 
 model_arg=""
 dataset_arg=""
-parallelism="tp"
-requested_tp_size=""
+tp_size=1
+pp_size=1
+ep_size=8
+gpu_count=8
+dispatcher=alltoall
+timing_dir=""
 output=""
 tokenizer_model=""
 tokenizer_type=""
@@ -70,7 +90,7 @@ max_new_tokens=64
 max_seq_length=4096
 kv_cache_gb=4
 dry_run=false
-skip_memory_check=false
+extra_args=()
 
 while (($#)); do
   case "$1" in
@@ -84,14 +104,34 @@ while (($#)); do
       dataset_arg="$2"
       shift 2
       ;;
-    --parallelism)
+    --tp)
       need_value "$@"
-      parallelism="$2"
+      tp_size="$2"
       shift 2
       ;;
-    --tp-size)
+    --pp)
       need_value "$@"
-      requested_tp_size="$2"
+      pp_size="$2"
+      shift 2
+      ;;
+    --ep)
+      need_value "$@"
+      ep_size="$2"
+      shift 2
+      ;;
+    --gpus)
+      need_value "$@"
+      gpu_count="$2"
+      shift 2
+      ;;
+    --dispatcher)
+      need_value "$@"
+      dispatcher="$2"
+      shift 2
+      ;;
+    --timing-dir)
+      need_value "$@"
+      timing_dir="$2"
       shift 2
       ;;
     --output)
@@ -134,10 +174,6 @@ while (($#)); do
       kv_cache_gb="$2"
       shift 2
       ;;
-    --skip-memory-check)
-      skip_memory_check=true
-      shift
-      ;;
     --dry-run)
       dry_run=true
       shift
@@ -145,6 +181,11 @@ while (($#)); do
     -h|--help)
       usage
       exit 0
+      ;;
+    --)
+      shift
+      extra_args=("$@")
+      break
       ;;
     *)
       die "unknown option: $1 (see --help)"
@@ -154,14 +195,10 @@ done
 
 [[ -n "$model_arg" ]] || die "--model is required"
 [[ -n "$dataset_arg" ]] || die "--dataset is required"
-[[ "$parallelism" == tp || "$parallelism" == dp ]] || die "--parallelism must be tp or dp"
-if [[ -n "$requested_tp_size" ]]; then
-  positive_integer --tp-size "$requested_tp_size"
-  case "$requested_tp_size" in
-    1|2|4) ;;
-    *) die "--tp-size must be 1, 2, or 4 for two or more DP replicas on eight GPUs" ;;
-  esac
-fi
+positive_integer --tp "$tp_size"
+positive_integer --pp "$pp_size"
+positive_integer --ep "$ep_size"
+positive_integer --gpus "$gpu_count"
 [[ "$precision" == bf16 || "$precision" == fp16 ]] || die "--precision must be bf16 or fp16"
 [[ -z "$samples" ]] || positive_integer --samples "$samples"
 positive_integer --max-new-tokens "$max_new_tokens"
@@ -169,6 +206,7 @@ positive_integer --max-seq-length "$max_seq_length"
 (( max_new_tokens <= max_seq_length )) || die "--max-new-tokens cannot exceed --max-seq-length"
 [[ "$kv_cache_gb" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "--kv-cache-gb must be a nonnegative number"
 [[ -z "$tokenizer_type" || -n "$tokenizer_model" ]] || die "--tokenizer-type requires --tokenizer-model"
+command -v python >/dev/null || die "python not found; source .venv/bin/activate first"
 
 case "$dataset_arg" in
   mtbench) dataset_arg=mtbench_first_turn ;;
@@ -186,35 +224,73 @@ fi
 [[ -s "$dataset" ]] || die "dataset is empty: $dataset"
 dataset="$(realpath "$dataset")"
 
+# Resolve --model to a checkpoint directory, preparing it from HF if needed.
+model_source=""
 if [[ -d "$model_arg" ]]; then
   model="$model_arg"
-elif [[ -d "$model_root/$model_arg" ]]; then
-  model="$model_root/$model_arg"
+  model_source=path
+elif [[ -d "$ckpt_root/$model_arg" ]]; then
+  model="$ckpt_root/$model_arg"
+  model_source=name
+elif [[ "$model_arg" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
+  model_name="${model_arg##*/}"
+  model="$ckpt_root/${model_name,,}-tp$tp_size-pp$pp_size-ep$ep_size"
+  model_source=hf
 else
-  die "model directory not found: $model_arg (looked under $model_root)"
-fi
-if [[ -f "$model/config.json" ]] && compgen -G "$model/*.safetensors" >/dev/null; then
-  die "$model contains Hugging Face weights, not a Megatron checkpoint. Convert it before using --model."
-fi
-model="$(realpath "$model")"
-if [[ -n "$tokenizer_model" && ! -e "$tokenizer_model" ]]; then
-  die "tokenizer model not found: $tokenizer_model"
-fi
-if [[ -n "$tokenizer_model" ]]; then
-  tokenizer_model="$(realpath "$tokenizer_model")"
+  die "model not found: $model_arg (not a directory, not under $ckpt_root, not an org/name HF repo ID)"
 fi
 
-# A legacy Megatron checkpoint has one mp_rank_XX directory per TP shard.
-# Inspect directory names and file sizes only; do not load multi-GB weights here.
+prepare_cmd=()
+if [[ "$model_source" == hf && ! -d "$model" ]]; then
+  prepare_cmd=(
+    "$repo_dir/deliverance/scripts/prepare_checkpoint.sh"
+    --hf-repo "$model_arg" --tp "$tp_size" --pp "$pp_size" --ep "$ep_size"
+  )
+  printf 'Checkpoint %s does not exist; preparing it from %s\n' "$model" "$model_arg"
+  if "$dry_run"; then
+    DELIVERANCE_CKPT_ROOT="$ckpt_root" "${prepare_cmd[@]}" --dry-run
+    printf '(dry run: skipping checks that need the converted checkpoint)\n'
+  else
+    DELIVERANCE_CKPT_ROOT="$ckpt_root" "${prepare_cmd[@]}"
+    [[ -d "$model" ]] || die "prepare_checkpoint.sh finished but $model does not exist"
+  fi
+fi
+
+if [[ -d "$model" ]]; then
+  if [[ -f "$model/config.json" ]] && compgen -G "$model/*.safetensors" >/dev/null; then
+    die "$model contains Hugging Face weights, not a Megatron checkpoint. Pass the HF repo ID instead to convert it."
+  fi
+  model="$(realpath "$model")"
+fi
+
+# Tokenizer: explicit flag, else the sidecar written by prepare_checkpoint.sh,
+# else whatever the checkpoint args recorded.
+source_json="$model/deliverance_source.json"
+if [[ -z "$tokenizer_model" && -s "$source_json" ]]; then
+  read -r tokenizer_type tokenizer_model < <(python - "$source_json" <<'EOF'
+import json, sys
+s = json.load(open(sys.argv[1]))
+print(s["tokenizer_type"], s["tokenizer_model"])
+EOF
+  )
+elif [[ -z "$tokenizer_model" && "$model_source" == hf ]] && "$dry_run"; then
+  tokenizer_type=Llama2Tokenizer
+  tokenizer_model="<hub snapshot of $model_arg>/tokenizer.model"
+fi
+if [[ -n "$tokenizer_model" && "$tokenizer_model" != \<* ]]; then
+  [[ -e "$tokenizer_model" ]] || die "tokenizer model not found: $tokenizer_model"
+  # -s: keep the readable hub snapshot path rather than its blobs/<hash> target.
+  tokenizer_model="$(realpath -s "$tokenizer_model")"
+fi
+
+# Inspect the checkpoint's directory names only; do not load multi-GB weights
+# here. A legacy checkpoint has one mp_rank_TT[_PPP][_EEE] directory per
+# model-parallel shard.
 checkpoint_format=""
-checkpoint_tp_size=""
-checkpoint_bytes=0
 
 inspect_checkpoint() {
   local tracker_file="$model/latest_checkpointed_iteration.txt"
-  local checkpoint_step checkpoint_dir shard_dir shard_name shard_file
-  local expected_name file_bytes index
-  local -a shard_dirs
+  local checkpoint_step checkpoint_dir shard tp pp ep found expected=0
 
   [[ -f "$tracker_file" ]] || die "checkpoint tracker not found: $tracker_file"
   checkpoint_step="$(< "$tracker_file")"
@@ -228,96 +304,34 @@ inspect_checkpoint() {
   fi
   [[ -d "$checkpoint_dir" ]] || die "checkpoint iteration directory not found: $checkpoint_dir"
 
-  # Megatron's distributed checkpoints have metadata instead of mp_rank_XX files.
+  # Megatron's distributed checkpoints have metadata instead of mp_rank_* files
+  # and are resharded at load time.
   if [[ -f "$checkpoint_dir/metadata.json" || -f "$checkpoint_dir/.metadata" ]]; then
     checkpoint_format=distributed
     return
   fi
 
-  shard_dirs=("$checkpoint_dir"/mp_rank_*)
-  [[ -e "${shard_dirs[0]}" ]] || die "checkpoint format not recognized in $checkpoint_dir"
+  found="$(find "$checkpoint_dir" -mindepth 1 -maxdepth 1 -type d -name 'mp_rank_*' | wc -l)"
+  (( found > 0 )) || die "checkpoint format not recognized in $checkpoint_dir"
 
-  for shard_dir in "${shard_dirs[@]}"; do
-    [[ -d "$shard_dir" ]] || die "expected a shard directory: $shard_dir"
-    shard_name="${shard_dir##*/}"
-    [[ "$shard_name" =~ ^mp_rank_[0-9][0-9]$ ]] || \
-      die "unsupported shard layout $shard_name (this launcher requires PP=1 and EP=1)"
+  for ((tp = 0; tp < tp_size; tp++)); do
+    for ((pp = 0; pp < pp_size; pp++)); do
+      for ((ep = 0; ep < ep_size; ep++)); do
+        printf -v shard 'mp_rank_%02d' "$tp"
+        (( pp_size == 1 )) || printf -v shard '%s_%03d' "$shard" "$pp"
+        (( ep_size == 1 )) || printf -v shard '%s_%03d' "$shard" "$ep"
+        [[ -s "$checkpoint_dir/$shard/model_optim_rng.pt" ]] ||
+          die "checkpoint layout does not match TP=$tp_size PP=$pp_size EP=$ep_size: missing $shard ($found shard directories present); legacy checkpoints cannot be resharded while loading"
+        expected=$((expected + 1))
+      done
+    done
   done
-
-  checkpoint_tp_size="${#shard_dirs[@]}"
-  for ((index = 0; index < checkpoint_tp_size; index++)); do
-    printf -v expected_name 'mp_rank_%02d' "$index"
-    shard_file="$checkpoint_dir/$expected_name/model_optim_rng.pt"
-    [[ -s "$shard_file" ]] || die "missing or empty checkpoint shard: $shard_file"
-    file_bytes="$(stat -c %s "$shard_file")"
-    checkpoint_bytes=$((checkpoint_bytes + file_bytes))
-  done
+  (( found == expected )) ||
+    die "checkpoint has $found shard directories but TP=$tp_size PP=$pp_size EP=$ep_size expects $expected"
   checkpoint_format=legacy
 }
 
-inspect_checkpoint
-
-if [[ "$parallelism" == tp ]]; then
-  [[ -z "$requested_tp_size" ]] || die "--tp-size is only used with --parallelism dp"
-  tp_size="$gpu_count"
-elif [[ -n "$requested_tp_size" ]]; then
-  tp_size="$requested_tp_size"
-elif [[ "$checkpoint_format" == legacy ]]; then
-  tp_size="$checkpoint_tp_size"
-else
-  die "cannot infer TP from a distributed checkpoint; pass --tp-size 1, 2, or 4"
-fi
-
-(( gpu_count % tp_size == 0 )) || die "TP=$tp_size does not divide $gpu_count GPUs"
-dp_size=$((gpu_count / tp_size))
-
-if [[ "$checkpoint_format" == legacy && "$tp_size" != "$checkpoint_tp_size" ]]; then
-  die "checkpoint is TP=$checkpoint_tp_size but launch requested TP=$tp_size; legacy checkpoints cannot be resharded while loading"
-fi
-if [[ "$parallelism" == dp && "$dp_size" -lt 2 ]]; then
-  die "DP mode needs at least two replicas; this checkpoint uses TP=$tp_size on all $gpu_count GPUs"
-fi
-
-# Each DP replica loads its own full copy of a legacy checkpoint into CPU RAM.
-# Reject runs near the host's available RAM; the TP=1 Mixtral run OOM-killed a
-# worker on this machine. This is a conservative preflight, not a guarantee.
-check_memory_headroom() {
-  local available_kib available_bytes estimated_bytes
-  local cgroup_limit cgroup_current cgroup_available
-
-  [[ "$checkpoint_format" == legacy && "$dp_size" -gt 1 ]] || return 0
-  if "$skip_memory_check"; then
-    printf 'Warning: host RAM safety check skipped.\n' >&2
-    return
-  fi
-
-  available_kib="$(awk '$1 == "MemAvailable:" { print $2 }' /proc/meminfo)"
-  [[ "$available_kib" =~ ^[0-9]+$ ]] || die "could not read available host RAM"
-  available_bytes=$((available_kib * 1024))
-
-  if [[ -r /sys/fs/cgroup/memory.max && -r /sys/fs/cgroup/memory.current ]]; then
-    cgroup_limit="$(< /sys/fs/cgroup/memory.max)"
-    cgroup_current="$(< /sys/fs/cgroup/memory.current)"
-    if [[ "$cgroup_limit" =~ ^[0-9]+$ && "$cgroup_current" =~ ^[0-9]+$ ]]; then
-      cgroup_available=$((cgroup_limit - cgroup_current))
-      if (( cgroup_available < available_bytes )); then
-        available_bytes="$cgroup_available"
-      fi
-    fi
-  fi
-
-  estimated_bytes=$((checkpoint_bytes * dp_size))
-  if (( estimated_bytes * 10 > available_bytes * 8 )); then
-    if "$dry_run"; then
-      printf 'Warning: estimated checkpoint load is %s GiB for DP=%s; available RAM is %s GiB.\n' \
-        "$((estimated_bytes / 1073741824))" "$dp_size" "$((available_bytes / 1073741824))" >&2
-    else
-      die "estimated checkpoint load is $((estimated_bytes / 1073741824)) GiB for DP=$dp_size, over 80% of $((available_bytes / 1073741824)) GiB available RAM. Use a higher-TP checkpoint or --skip-memory-check if you accept the OOM risk"
-    fi
-  fi
-}
-
-check_memory_headroom
+[[ ! -d "$model" ]] || inspect_checkpoint
 
 if [[ -z "$output" ]]; then
   output="$repo_dir/local/moe-inference-results/$(date +%Y%m%d-%H%M%S)-$$.json"
@@ -325,16 +339,26 @@ elif [[ "$output" != /* ]]; then
   output="$(pwd)/$output"
 fi
 [[ ! -e "$output" && ! -L "$output" ]] || die "output already exists: $output"
+manifest="${output%.json}.manifest.json"
+diff_file="${output%.json}.diff"
+
+if [[ -n "$timing_dir" ]]; then
+  [[ "$timing_dir" == /* ]] || timing_dir="$(pwd)/$timing_dir"
+  ! compgen -G "$timing_dir/rank*.jsonl" >/dev/null || die "timing directory already has rank files: $timing_dir"
+fi
 
 cmd=(
   python -m torch.distributed.run --standalone "--nproc-per-node=$gpu_count" -m examples.inference.offline_inference
   --load "$model"
   --use-checkpoint-args --auto-detect-ckpt-format
   --tensor-model-parallel-size "$tp_size"
-  --pipeline-model-parallel-size 1
-  --expert-model-parallel-size 1
+  --pipeline-model-parallel-size "$pp_size"
+  --expert-model-parallel-size "$ep_size"
   --micro-batch-size 1
-  --moe-token-dispatcher-type alltoall
+  --moe-token-dispatcher-type "$dispatcher"
+  # Pinned so runs compare the same layer implementation; inference_optimized
+  # would swap in a different MoE dispatch path.
+  --transformer-impl transformer_engine
   --dist-ckpt-strictness log_unexpected
   "--$precision"
   --use-coordinator
@@ -349,15 +373,21 @@ if [[ -n "$samples" ]]; then
   cmd+=(--prompt-file-num-truncate "$samples")
 fi
 if [[ -n "$tokenizer_model" ]]; then
+  # Without this flag the checkpoint's tokenizer args override ours.
   cmd+=(
     --no-use-tokenizer-model-from-checkpoint-args
-    --tokenizer-type "${tokenizer_type:-HuggingFaceTokenizer}"
+    --tokenizer-type "${tokenizer_type:-Llama2Tokenizer}"
     --tokenizer-model "$tokenizer_model"
   )
 fi
+cmd+=("${extra_args[@]}")
 
-printf 'Model: %s\nDataset: %s\nCheckpoint: %s\nParallelism: TP=%s DP=%s\nOutput: %s\n' \
-  "$model" "$dataset" "$checkpoint_format" "$tp_size" "$dp_size" "$output"
+printf 'Model: %s (%s)\nCheckpoint: %s\nDataset: %s\n' \
+  "$model" "$model_source" "${checkpoint_format:-not yet prepared}" "$dataset"
+printf 'Parallelism: TP=%s PP=%s EP=%s on %s GPUs\n' \
+  "$tp_size" "$pp_size" "$ep_size" "$gpu_count"
+printf 'Dispatcher: %s\nTokenizer: %s\nTiming: %s\nOutput: %s\n' \
+  "$dispatcher" "${tokenizer_model:-from checkpoint args}" "${timing_dir:-off}" "$output"
 if "$dry_run"; then
   printf 'Command: '
   printf '%q ' "${cmd[@]}"
@@ -365,7 +395,44 @@ if "$dry_run"; then
   exit 0
 fi
 
-command -v python >/dev/null || die "python not found; activate the container's Python environment"
 cd "$repo_dir"
 mkdir -p "$(dirname "$output")"
+if [[ -n "$timing_dir" ]]; then
+  mkdir -p "$timing_dir"
+  export MOE_PHASE_TIMING_DIR="$timing_dir"
+fi
+
+# Record what produced the results, for reproducibility.
+git_dirty=false
+if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
+  git_dirty=true
+  git diff HEAD > "$diff_file"
+fi
+python - "$manifest" "$git_dirty" "$diff_file" "$model_source" "$model_arg" "$model" \
+  "$tp_size" "$pp_size" "$ep_size" "$gpu_count" "${cmd[@]}" <<'EOF'
+import datetime, importlib.metadata as md, json, os, socket, subprocess, sys
+(out, dirty, diff_file, source, model_arg, model,
+ tp, pp, ep, gpus), cmd = sys.argv[1:11], sys.argv[11:]
+def git(*a):
+    return subprocess.run(["git", *a], capture_output=True, text=True).stdout.strip()
+def ver(p):
+    try:
+        return md.version(p)
+    except md.PackageNotFoundError:
+        return None
+env_keys = ("CUDA_", "NCCL_", "MOE_", "DELIVERANCE_", "HF_HUB_", "TORCH_", "PYTORCH_", "NVTE_")
+json.dump({
+    "created": datetime.datetime.now().astimezone().isoformat(),
+    "host": socket.gethostname(),
+    "git": {"commit": git("rev-parse", "HEAD"), "branch": git("rev-parse", "--abbrev-ref", "HEAD"),
+            "dirty": dirty == "true", "diff": diff_file if dirty == "true" else None},
+    "model": {"arg": model_arg, "source": source, "checkpoint": model},
+    "parallelism": {"tp": int(tp), "pp": int(pp), "ep": int(ep), "gpus": int(gpus)},
+    "versions": {p: ver(p) for p in ("torch", "transformer_engine", "transformers", "megatron-core")},
+    "env": {k: v for k, v in sorted(os.environ.items()) if k.startswith(env_keys)},
+    "command": cmd,
+}, open(out, "w"), indent=2)
+EOF
+printf 'Manifest: %s\n' "$manifest"
+
 exec "${cmd[@]}"

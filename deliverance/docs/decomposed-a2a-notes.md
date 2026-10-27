@@ -48,11 +48,16 @@ Working notes for `MoEDecomposedAlltoAllDispatcher`
 
 ### Launcher / run setup (later)
 
-- [ ] Run with EP=8: either add an EP option to `run_moe_inference.sh` (currently hard-codes
-      `--expert-model-parallel-size 1`) or drive it through environment variables. Undecided.
-- [ ] Select the new dispatcher type from the launcher / env.
-- [ ] Get an EP-reshardable Mixtral 8×7B checkpoint (`torch_dist`). Legacy shards cannot
-      be resharded to EP=8.
+- [x] Run with EP=8: `run_moe_inference.sh` takes `--tp/--pp/--ep` (default 1/1/8) and
+      prepares the checkpoint from HF on first use ([moe-inference.md](moe-inference.md)).
+- [ ] Select the new dispatcher type from the launcher: `--dispatcher` passes
+      `--moe-token-dispatcher-type` through; it works once the type is registered.
+- [x] Get an EP=8 Mixtral 8×7B checkpoint: converted to legacy TP=1/PP=1/EP=8
+      (`/depot/shared/megatron-checkpoints/mixtral-8x7b-v0.1-tp1-pp1-ep8`). Token IDs match the
+      TP=4/EP=1 checkpoint. Not reshardable; other layouts are converted separately.
+- [ ] Natural EOS with the **base** Mixtral: on gsm8k it emits newline tokens (ID 13) rather than
+      ending, so "natural EOS" runs may go to the token cap. Decide between the base model with a
+      cap, or `mistralai/Mixtral-8x7B-Instruct-v0.1` (same architecture, one conversion).
 
 ### Inference-engine interaction (later)
 
@@ -286,6 +291,52 @@ SYS (through UPI).
 - **Decomposition cost:** cache by `D` for repeated decode shapes. Overlap it with permute.
 - **Buffers:** preallocate recv/out buffers across layers.
 - **Shared experts:** overlap with matching-1 dispatch (Mixtral has none; relevant for DeepSeek).
+
+## Benchmark testbed
+
+Metrics, in priority order:
+
+1. **Layer makespan**: from the MoE phase timer ([moe-timing.md](moe-timing.md)).
+2. **Overlap**: from the same timer data.
+3. **End-to-end completion time**: wall-clock of the `generate()` call.
+4. **TTFT**: per-request, already recorded by the engine and written to the results JSON
+   (`"ttft"`). No code change needed.
+
+Serving latency under an arrival process is out of scope.
+
+| Decision | Status |
+| --- | --- |
+| Offline closed-batch runs with `offline_inference`, no client/server | Agreed |
+| Keep the coordinator (`--use-coordinator`); one process per trial. No code changes | Agreed |
+| Natural EOS (no forced output length). Compare generated token IDs between stock and decomposed runs; if they diverge, normalise end-to-end time per generated token | Agreed |
+| Two regimes: prefill-only (`--max-new-tokens 1`) and prefill + decode | Agreed |
+
+Consequences and caveats:
+
+- **Warmup is trimmed in analysis.** Drop the first K steps from the timer data before computing
+  layer makespan and overlap.
+- **End-to-end time includes first-time costs** (NCCL connection setup, allocator growth, kernel
+  compilation). The decomposed path's extra communicators make this cost larger for it. To check:
+  `NCCL_RUNTIME_CONNECT=0` (connect all peers at communicator creation) may move NCCL setup out
+  of the timed region, depending on the NCCL version.
+- **Comparisons are unpaired.** The coordinator assigns prompts to ranks dynamically, so `D`
+  differs between runs. Compare distributions (makespan bucketed by token count) over several
+  trials, not run against run.
+- **Prefill-only regime:** with one output token, end-to-end time ≈ the batch's prefill time
+  (≈ max TTFT), with no decode or EOS effects.
+- **TTFT here is not serving TTFT.** All requests arrive at t=0, so TTFT = queueing behind other
+  prefills + own prefill. It reflects engine prefill scheduling (max tokens per step, chunked
+  prefill) as much as the dispatcher, so those settings must be identical across compared runs.
+  Report it as per-request prefill completion time.
+
+### Testbed checklist
+
+- [x] Confirm `ttft` is non-null in a coordinator-mode results JSON (first real run). Confirmed
+      2026-10-27; `latency` is also populated in coordinator mode.
+- [ ] Choose warmup trim K. First run: steps 0–1 are warmup outliers, so K ≥ 2. Confirm on a
+      longer run.
+- [ ] Check `NCCL_RUNTIME_CONNECT=0` support in the installed NCCL.
+- [ ] Generated-token-ID comparison between stock and decomposed runs (analysis step).
 
 ## Timing
 

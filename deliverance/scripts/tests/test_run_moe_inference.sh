@@ -1,48 +1,61 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Exercise topology selection without loading a model or using a GPU.
+# Exercise topology and model selection without loading a model or using a GPU.
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 launcher="$script_dir/../run_moe_inference.sh"
 fixtures_dir="$(mktemp -d)"
 trap 'rm -r -- "$fixtures_dir"' EXIT
 
+# Keep the HF route and name lookups inside the fixtures.
+export DELIVERANCE_CKPT_ROOT="$fixtures_dir/ckpts"
+unset DELIVERANCE_MODEL_ROOT
+mkdir -p "$DELIVERANCE_CKPT_ROOT"
+
 dataset="$fixtures_dir/prompts.jsonl"
 printf '{"text":"hello"}\n' > "$dataset"
 
+# make_legacy_checkpoint DIR TP PP EP: shard names follow Megatron's
+# mp_rank_TT[_PPP][_EEE] convention.
 make_legacy_checkpoint() {
-  local name="$1"
-  local tp_size="$2"
-  local checkpoint_dir="$fixtures_dir/$name"
-  local shard_name index
+  local checkpoint_dir="$1" tp_size="$2" pp_size="$3" ep_size="$4"
+  local shard tp pp ep
 
   mkdir -p "$checkpoint_dir/iter_0000001"
   printf '1\n' > "$checkpoint_dir/latest_checkpointed_iteration.txt"
 
-  for ((index = 0; index < tp_size; index++)); do
-    printf -v shard_name 'mp_rank_%02d' "$index"
-    mkdir -p "$checkpoint_dir/iter_0000001/$shard_name"
-    printf 'fixture\n' > "$checkpoint_dir/iter_0000001/$shard_name/model_optim_rng.pt"
+  for ((tp = 0; tp < tp_size; tp++)); do
+    for ((pp = 0; pp < pp_size; pp++)); do
+      for ((ep = 0; ep < ep_size; ep++)); do
+        printf -v shard 'mp_rank_%02d' "$tp"
+        (( pp_size == 1 )) || printf -v shard '%s_%03d' "$shard" "$pp"
+        (( ep_size == 1 )) || printf -v shard '%s_%03d' "$shard" "$ep"
+        mkdir -p "$checkpoint_dir/iter_0000001/$shard"
+        printf 'fixture\n' > "$checkpoint_dir/iter_0000001/$shard/model_optim_rng.pt"
+      done
+    done
   done
 }
 
-expect_topology() {
+expect_output() {
   local expected="$1"
   shift
 
-  local output tp_size
-  output="$(bash "$launcher" --dataset "$dataset" --dry-run "$@")"
-  if [[ "$output" != *"Parallelism: $expected"* ]]; then
-    printf 'Expected %s, got:\n%s\n' "$expected" "$output" >&2
+  local output
+  output="$(bash "$launcher" --dataset "$dataset" --dry-run "$@" 2>&1)"
+  if [[ "$output" != *"$expected"* ]]; then
+    printf 'Expected output containing %q, got:\n%s\n' "$expected" "$output" >&2
     exit 1
   fi
+}
 
-  [[ "$expected" =~ TP=([0-9]+) ]] || exit 1
-  tp_size="${BASH_REMATCH[1]}"
-  if [[ "$output" != *"--tensor-model-parallel-size $tp_size"* ]]; then
-    printf 'The command does not use TP=%s:\n%s\n' "$tp_size" "$output" >&2
-    exit 1
-  fi
+# Checks the sizes passed to Megatron.
+expect_topology() {
+  local tp="$1" pp="$2" ep="$3"
+  shift 3
+
+  expect_output "Parallelism: TP=$tp PP=$pp EP=$ep on 8 GPUs" "$@"
+  expect_output "--tensor-model-parallel-size $tp --pipeline-model-parallel-size $pp --expert-model-parallel-size $ep" "$@"
 }
 
 expect_error() {
@@ -60,59 +73,69 @@ expect_error() {
   fi
 }
 
-make_legacy_checkpoint tp1 1
-make_legacy_checkpoint tp2 2
-make_legacy_checkpoint tp4 4
-make_legacy_checkpoint tp8 8
+make_legacy_checkpoint "$fixtures_dir/tp1-ep1" 1 1 1
+make_legacy_checkpoint "$fixtures_dir/tp4-ep1" 4 1 1
+make_legacy_checkpoint "$fixtures_dir/tp8-ep1" 8 1 1
+make_legacy_checkpoint "$fixtures_dir/tp1-ep8" 1 1 8
+make_legacy_checkpoint "$fixtures_dir/tp2-ep4" 2 1 4
+make_legacy_checkpoint "$fixtures_dir/tp1-pp2-ep4" 1 2 4
 
-expect_topology 'TP=8 DP=1' --model "$fixtures_dir/tp8" --parallelism tp
-expect_topology 'TP=1 DP=8' --model "$fixtures_dir/tp1" --parallelism dp
-expect_topology 'TP=2 DP=4' --model "$fixtures_dir/tp2" --parallelism dp
-expect_topology 'TP=4 DP=2' --model "$fixtures_dir/tp4" --parallelism dp
-expect_topology 'TP=4 DP=2' --model "$fixtures_dir/tp4" --parallelism dp --tp-size 4
+# Defaults are TP=1, PP=1, EP=8.
+expect_topology 1 1 8 --model "$fixtures_dir/tp1-ep8"
+expect_topology 1 1 1 --model "$fixtures_dir/tp1-ep1" --ep 1
+expect_topology 4 1 1 --model "$fixtures_dir/tp4-ep1" --tp 4 --ep 1
+expect_topology 8 1 1 --model "$fixtures_dir/tp8-ep1" --tp 8 --ep 1
+expect_topology 2 1 4 --model "$fixtures_dir/tp2-ep4" --tp 2 --ep 4
+expect_topology 1 2 4 --model "$fixtures_dir/tp1-pp2-ep4" --pp 2 --ep 4
 
-expect_error 'needs at least two replicas' --model "$fixtures_dir/tp8" --parallelism dp
-expect_error 'checkpoint is TP=4 but launch requested TP=2' \
-  --model "$fixtures_dir/tp4" --parallelism dp --tp-size 2
-expect_error 'checkpoint is TP=4 but launch requested TP=8' \
-  --model "$fixtures_dir/tp4" --parallelism tp
-expect_error '--tp-size must be 1, 2, or 4' \
-  --model "$fixtures_dir/tp4" --parallelism dp --tp-size 3
-expect_error '--model needs a value' --model --parallelism dp
+# Legacy layouts must match the request exactly.
+expect_error 'layout does not match TP=1 PP=1 EP=8' --model "$fixtures_dir/tp4-ep1"
+expect_error 'checkpoint has 4 shard directories but TP=2 PP=1 EP=1 expects 2' \
+  --model "$fixtures_dir/tp4-ep1" --tp 2 --ep 1
+expect_error 'checkpoint has 8 shard directories but TP=1 PP=1 EP=4 expects 4' \
+  --model "$fixtures_dir/tp1-ep8" --ep 4
+expect_error 'layout does not match TP=1 PP=1 EP=4' --model "$fixtures_dir/tp1-pp2-ep4" --ep 4
+
+make_legacy_checkpoint "$fixtures_dir/incomplete" 1 1 8
+rm -- "$fixtures_dir/incomplete/iter_0000001/mp_rank_00_005/model_optim_rng.pt"
+expect_error 'missing mp_rank_00_005' --model "$fixtures_dir/incomplete"
+
+# Argument validation.
+expect_error '--model needs a value' --model --ep 8
 expect_error '--max-new-tokens cannot exceed --max-seq-length' \
-  --model "$fixtures_dir/tp4" --parallelism dp \
-  --max-new-tokens 33 --max-seq-length 32
-expect_error 'output already exists' \
-  --model "$fixtures_dir/tp4" --parallelism dp --output "$dataset"
-
+  --model "$fixtures_dir/tp1-ep8" --max-new-tokens 33 --max-seq-length 32
+expect_error 'output already exists' --model "$fixtures_dir/tp1-ep8" --output "$dataset"
 ln -s "$fixtures_dir/nonexistent.json" "$fixtures_dir/broken-output-link.json"
 expect_error 'output already exists' \
-  --model "$fixtures_dir/tp4" --parallelism dp \
-  --output "$fixtures_dir/broken-output-link.json"
+  --model "$fixtures_dir/tp1-ep8" --output "$fixtures_dir/broken-output-link.json"
 
+# Distributed checkpoints are resharded at load time, so any layout is accepted.
 mkdir -p "$fixtures_dir/distributed/iter_0000001"
 printf '1\n' > "$fixtures_dir/distributed/latest_checkpointed_iteration.txt"
 printf '{}\n' > "$fixtures_dir/distributed/iter_0000001/metadata.json"
-expect_error 'cannot infer TP from a distributed checkpoint' \
-  --model "$fixtures_dir/distributed" --parallelism dp
-expect_topology 'TP=4 DP=2' \
-  --model "$fixtures_dir/distributed" --parallelism dp --tp-size 4
+expect_topology 1 1 8 --model "$fixtures_dir/distributed"
+expect_topology 4 1 2 --model "$fixtures_dir/distributed" --tp 4 --ep 2
 
-make_legacy_checkpoint incomplete 4
-rm -- "$fixtures_dir/incomplete/iter_0000001/mp_rank_02/model_optim_rng.pt"
-expect_error 'missing or empty checkpoint shard' \
-  --model "$fixtures_dir/incomplete" --parallelism dp
+# Model resolution: name under the checkpoint root, then HF repo ID.
+make_legacy_checkpoint "$DELIVERANCE_CKPT_ROOT/some-ckpt" 1 1 8
+expect_output "(name)" --model some-ckpt
+make_legacy_checkpoint "$DELIVERANCE_CKPT_ROOT/mixtral-8x7b-v0.1-tp1-pp1-ep8" 1 1 8
+expect_output "$DELIVERANCE_CKPT_ROOT/mixtral-8x7b-v0.1-tp1-pp1-ep8 (hf)" --model mistralai/Mixtral-8x7B-v0.1
+expect_error 'model not found: nope' --model nope
 
-make_legacy_checkpoint nonconsecutive 4
-mv -- "$fixtures_dir/nonconsecutive/iter_0000001/mp_rank_02" \
-  "$fixtures_dir/nonconsecutive/iter_0000001/mp_rank_05"
-expect_error 'missing or empty checkpoint shard' \
-  --model "$fixtures_dir/nonconsecutive" --parallelism dp
+# The sidecar written by prepare_checkpoint.sh supplies the tokenizer.
+printf 'tok\n' > "$fixtures_dir/tokenizer.model"
+printf '{"tokenizer_type": "Llama2Tokenizer", "tokenizer_model": "%s"}\n' "$fixtures_dir/tokenizer.model" \
+  > "$DELIVERANCE_CKPT_ROOT/some-ckpt/deliverance_source.json"
+expect_output "--no-use-tokenizer-model-from-checkpoint-args --tokenizer-type Llama2Tokenizer --tokenizer-model $fixtures_dir/tokenizer.model" \
+  --model some-ckpt
 
-make_legacy_checkpoint pipeline_parallel 4
-mv -- "$fixtures_dir/pipeline_parallel/iter_0000001/mp_rank_02" \
-  "$fixtures_dir/pipeline_parallel/iter_0000001/mp_rank_02_000"
-expect_error 'unsupported shard layout' \
-  --model "$fixtures_dir/pipeline_parallel" --parallelism dp
+# Pinned settings, timing and pass-through.
+expect_output "--moe-token-dispatcher-type allgather --transformer-impl transformer_engine" \
+  --model "$fixtures_dir/tp1-ep8" --dispatcher allgather
+expect_output "Timing: $fixtures_dir/timing" --model "$fixtures_dir/tp1-ep8" --timing-dir "$fixtures_dir/timing"
+mkdir -p "$fixtures_dir/used-timing" && touch "$fixtures_dir/used-timing/rank00000.jsonl"
+expect_error 'already has rank files' --model "$fixtures_dir/tp1-ep8" --timing-dir "$fixtures_dir/used-timing"
+expect_output "--incoming-requests-per-sec -1 --num-layers 2" --model "$fixtures_dir/tp1-ep8" -- --num-layers 2
 
 printf 'Launcher topology tests passed.\n'

@@ -116,16 +116,27 @@ if [[ "${ADVENT}" == "1" ]]; then
 	# Export now: this script already sourced activate, so it will not re-read
 	# the lines appended below, and the inference test at the end needs them.
 	export DEPOT="/depot/deliverance/"
-	export DELIVERANCE_MODEL_ROOT="/depot/deliverance/models"
-	export DELIVERANCE_DATASET_ROOT="/depot/deliverance/datasets/moe-inference-datasets"
+	export DELIVERANCE_MODEL_ROOT="/depot/shared/megatron-checkpoints"
+	export DELIVERANCE_CKPT_ROOT="/depot/shared/megatron-checkpoints"
+	export DELIVERANCE_DATASET_ROOT="/depot/shared/datasets/moe-inference-datasets"
+	export HF_HOME="${HF_HOME:-/depot/shared/.cache/huggingface}"
+	export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
+	export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-$HF_HOME/datasets}"
 
 	# Persist for future shells. Guarded so re-runs do not append duplicates.
 	if ! grep -q "DELIVERANCE_MODEL_ROOT" .venv/bin/activate; then
 		cat >> .venv/bin/activate <<'EOT'
 export ADVENT=1
 export DEPOT="/depot/deliverance/"
-export DELIVERANCE_MODEL_ROOT="/depot/deliverance/models"
-export DELIVERANCE_DATASET_ROOT="/depot/deliverance/datasets/moe-inference-datasets"
+# Megatron checkpoints: run_moe_inference.sh reads DELIVERANCE_MODEL_ROOT,
+# prepare_checkpoint.sh reads DELIVERANCE_CKPT_ROOT.
+export DELIVERANCE_MODEL_ROOT="/depot/shared/megatron-checkpoints"
+export DELIVERANCE_CKPT_ROOT="/depot/shared/megatron-checkpoints"
+export DELIVERANCE_DATASET_ROOT="/depot/shared/datasets/moe-inference-datasets"
+# Also set in /etc/profile.d/huggingface.sh, which non-login shells skip.
+export HF_HOME="${HF_HOME:-/depot/shared/.cache/huggingface}"
+export HF_HUB_CACHE="${HF_HUB_CACHE:-$HF_HOME/hub}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-$HF_HOME/datasets}"
 EOT
 	fi
 fi
