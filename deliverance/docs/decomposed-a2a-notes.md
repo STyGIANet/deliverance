@@ -2,15 +2,31 @@
 
 Working notes for `MoEDecomposedAlltoAllDispatcher`
 (`megatron/core/transformer/moe/token_dispatcher.py`). Reference: [ref.pdf](ref.pdf).
+Implementation plan: [decomposed-a2a-plan.md](decomposed-a2a-plan.md).
 
 > [!IMPORTANT]
-> **More than one local expert per rank (`num_local_experts > 1`) has severe implications.**
-> Mixtral at EP=8 has 1 expert/rank and hides all of this. DeepSeek, Qwen3, or Mixtral at EP<8 do not.
+> **More than one local expert per rank (`num_local_experts > 1`) is supported, and it costs
+> compute.** Mixtral at EP=8 has 1 expert/rank and hides all of this. DeepSeek, Qwen3, or Mixtral
+> at EP<8 do not.
+>
+> Communication is unaffected, **because of the max-weight decomposition.** It realises each
+> `(src, dst)` pair in exactly one matching, so each transmission is the full `D[src, dst]`
+> chunk. The stock permute has already sorted that chunk by expert. That is exactly what the
+> stock alltoallv moves for that pair, so the transport never needs to know which token goes
+> to which expert, and no extra work is needed. A decomposition such as BvN can realise one
+> pair over several matchings, splitting `D[src, dst]` into pieces. Then either the pieces need
+> per-expert bookkeeping (which expert's tokens are in which piece), or, if sent in stock order,
+> the later experts' tokens wait for later matchings. Keep this in mind before swapping
+> `decompose()`.
+>
+> The costs are all in compute:
 >
 > 1. **Coalescing breaks expert contiguity.** A chunk from one source is already expert-sorted
 >    (`[e0 | e1]`), but a coalesced batch from two sources is `[src_a: e0, e1 | src_b: e0, e1]`.
->    Grouped GEMM needs each expert's tokens contiguous, so every batch needs a re-sort before
->    the experts and an un-sort after: an extra permute + copy per batch.
+>    Grouped GEMM needs each expert's tokens contiguous, so a batch spanning several sources
+>    needs a re-sort before the experts and an un-sort after: an extra permute + copy per batch.
+>    This is the stock "permutation 2" (`sort_chunks_by_idxs`), applied per batch instead of
+>    once. Single-source batches (always at τ=0) need no sort.
 > 2. **The knee applies per expert, not per matching.** A batch of `n` tokens splits into
 >    `E_local` segments of about `n / E_local`. A matching that looks large at rank level can
 >    still give each expert a tiny GEMM.
@@ -30,11 +46,17 @@ Working notes for `MoEDecomposedAlltoAllDispatcher`
 | Pipeline all three stages: dispatch(k+1) ‖ compute(k) ‖ combine(k-1) | Agreed |
 | Test model: Mixtral 8×7B on the existing inference setup (`run_moe_inference.sh`) | Agreed |
 | Dedicated compute stream; main stream only joins at the end | Agreed |
-| Decomposition: greedy max-weight (JV / `linear_sum_assignment`), whole entries removed per round, ≤ `ep_size` matchings | Draft |
+| Decomposition: greedy max-weight (JV / `linear_sum_assignment`) over the complete bipartite graph of rank pairs, minus the diagonal. Each round takes the max-weight perfect matching among unused pairs (zero-weight included) and removes them. Exactly `n − 1` matchings; each off-diagonal pair in exactly one. The schedule is what it returns; only `order()` changes it | Agreed |
+| Diagonal `D[i,i]` is not routed (no P2P). The local chunk is chunk 0 of the receive buffer (one on-device copy, as the stock alltoallv's self-send does) and is computed first, while matching 1 is in flight | Agreed |
+| A compute batch with 0 tokens skips `experts()` and only records its event. Compute-side only; the schedule is unchanged | Agreed |
 | Expert compute granularity: option B, coalesce received chunks until ≥ τ tokens, then one `experts()` call. τ=0 → one call per matching; τ=∞ → one call at the end (baseline) | Agreed |
 | Receive buffer in schedule (arrival) order so consecutive matchings are contiguous and coalescing is a free slice; `out` stays in stock layout | Agreed |
-| No global barrier between matchings by default; barrier available as a flag | Proposed |
-| Dev target: TP=1, EP=8, one expert per rank | Proposed |
+| Adaptation, not OCS emulation: borrow only the decomposition. No barrier and no reconfiguration delay; each rank starts its next matching as soon as its P2P ops for the current one complete | Agreed |
+| Dispatcher type name: `decomposed_alltoall` | Agreed |
+| τ config: `None` = ∞ (one `experts()` call at the end) | Agreed |
+| Take `D` as the system produces it (no masking of padded / dummy tokens); only the transport changes | Agreed |
+| `num_local_experts > 1` supported from the start. Communication is unchanged because max-weight realises each `(src, dst)` pair in exactly one matching: a chunk is all of `src`'s tokens for `dst`, as in the stock alltoallv. Compute expert-sorts batches that span several sources | Agreed |
+| Dev target: TP=1, EP=8 on Mixtral (one expert per rank); multi-expert correctness tested at unit level | Proposed |
 
 ## Checklist
 
@@ -61,9 +83,9 @@ Working notes for `MoEDecomposedAlltoAllDispatcher`
 
 ### Inference-engine interaction (later)
 
-- [ ] Padding / idle-rank tokens: the engine MAX-syncs batch dims across EP and runs
-      `dummy_forward()` on idle ranks. Those tokens are routed and inflate `D`. Decide whether
-      to mask them out of `D` and/or skip sending them.
+- [x] Padding / idle-rank tokens: the engine MAX-syncs batch dims across EP and runs
+      `dummy_forward()` on idle ranks. Those tokens are routed and inflate `D`. Decided: keep
+      them. The stock alltoallv sends them too, so `D` is the same demand the stock path serves.
 
 ### Implementation
 
@@ -71,7 +93,6 @@ Working notes for `MoEDecomposedAlltoAllDispatcher`
 - [ ] `dispatch_compute_combine()` with dispatch / compute / combine streams.
 - [ ] Separate NCCL communicators for dispatch and combine.
 - [ ] `MoELayer.forward` hook.
-- [ ] `--wait-for-slowest` barrier flag (+ optional `--reconfig-delay-us`).
 
 ### Validation
 
@@ -103,7 +124,33 @@ Working notes for `MoEDecomposedAlltoAllDispatcher`
 - **NCCL op ordering / deadlock.** Ops on a communicator must be issued in the same order on all
   ranks. Dispatch and combine on different streams sharing a communicator can hang, so use
   separate communicators.
+- **A matching's send and receive must be one NCCL group** (`batch_isend_irecv`, which wraps the
+  `isend` and `irecv` in `ncclGroupStart/End`). In a matching, rank `i` sends to `perm[i]` but
+  receives from `perm⁻¹[i]`, usually a different rank: a matching is a permutation made of
+  cycles. With send-then-receive on the cycle 0 → 1 → 2 → 0, every rank spins in its send
+  waiting for a receive that is never posted, so all three hang. A separate `isend` + `irecv`
+  is no safer: each is its own NCCL kernel, and whether this rank's receive can run while its
+  own send is still spinning depends on PyTorch's internal stream/communicator choice. A group
+  progresses both by contract. NCCL's blocking (a spinning kernel, no backoff or retry, abort
+  on the watchdog timeout) is the intended behaviour. Matchings never interleave on a rank:
+  groups on one communicator run in issue order on its NCCL stream.
+- **`batch_isend_irecv([])` raises** (it reads `p2p_op_list[0]`). When both of a rank's counts
+  in a matching are 0, make no call for that matching (the per-op rule below).
+- **Every rank must take part in the first call on a new communicator.** PyTorch:
+  "if this API is the first collective call in the group … all ranks of the group must
+  participate … otherwise, the behavior is undefined." Because of the zero-count rule, some
+  ranks may skip the first matching. So initialise the dispatch and combine communicators
+  eagerly in `__init__` (e.g. a tiny all-reduce on each) before any P2P.
+- **P2P work runs on PyTorch's internal NCCL stream, not on `s_disp`/`s_comb`.** Call
+  `work.wait()` on the returned works with `s_disp` (or `s_comb`) current. That is a GPU-side
+  wait and does not block the CPU. Record `ev_disp[k]` after it, otherwise the event does not
+  mark the transfer's end. For timing, a start event on `s_disp` marks when the call was issued,
+  not when NCCL started moving data.
 - **Schedule must be identical on every rank.** Use deterministic tie-breaking.
+- **Zero-token pairs: post per op, not per rank.** In a matching a rank may send nothing but
+  still receive (or the reverse). Post a send only if `D[me, dst] > 0` and a receive only if
+  `D[src, me] > 0`. Both ends read the same `D`, so they always agree. Skipping a whole matching
+  because there is nothing to send would leave the peer that sends to this rank waiting forever.
 - **Host syncs inside the pipeline.** Any `.item()` / `.tolist()` on a GPU tensor inside the
   per-matching loop stalls the CPU and stops further kernel issue. Overlap then silently
   disappears. All split sizes must already be on the CPU (they are, after the existing DtoH sync).
@@ -113,24 +160,27 @@ Working notes for `MoEDecomposedAlltoAllDispatcher`
 - **`CUDA_DEVICE_MAX_CONNECTIONS`.** Has no effect on Blackwell, so no hardware-queue
   serialization across streams here. It would matter on Hopper/Ampere, where `=1` funnels every
   stream into one queue and CPU issue order then decides the overlap.
-- **D is already free.** `preprocess()` all-gathers per-expert counts over the TP×EP group and the
-  existing DtoH sync brings them to the CPU.
+- **D is almost free.** `preprocess()` all-gathers per-expert counts over the TP×EP group
+  (`num_global_tokens_per_expert`), but that tensor is a local variable. The existing DtoH copy
+  only brings this rank's row (`input_splits`) and column (`output_splits`) to the CPU. The
+  subclass must keep the full tensor and add it to the same DtoH copy (no extra sync).
 - **Buffer layout.** Send chunks are contiguous per destination (`input_splits`). Recv chunks
   placed at `output_splits` offsets reproduce the stock layout, so stock `combine_postprocess`
   works unchanged.
-- **Not supported initially:** TP>1, CUDA graphs, `drop_and_pad`, `num_local_experts > 1`
-  (see the IMPORTANT note at the top).
-- **Emulation, not OCS.** Without a barrier, ranks can be in different matchings at once.
-  Label such results "ordered P2P", not "OCS".
+- **Not supported initially:** TP>1, CUDA graphs, `drop_and_pad`. `num_local_experts > 1` is
+  supported (see the IMPORTANT note at the top).
+- **Adaptation, not OCS.** Only the decomposition is borrowed. There is no barrier and no
+  reconfiguration delay, so ranks can be in different matchings at once. Label results
+  "ordered P2P", not "OCS".
 
-## Straggler handling (no barrier)
+## Straggler handling (no barrier, by design)
 
-P2P flow control stalls a sender once the receiver's NCCL buffer fills, so progression
-self-throttles. With fixed durations, removing the barrier cannot increase makespan. Caveats:
+Each matching's P2P on a rank completes once both its send partner and its receive partner have
+posted theirs, so ranks progress pairwise and self-throttle. With fixed durations, the absence of
+a barrier cannot increase makespan. Caveats:
 
 - A slow pair delays everything downstream of it in the dependency chain. It is not hidden.
 - SM/HBM/PCIe contention means durations are not actually fixed.
-- Not faithful to the paper's model. Keep `--wait-for-slowest` (+ optional `--reconfig-delay-us`).
 
 ## Design principle: theory first, testbed second
 
@@ -139,7 +189,6 @@ exposes only generic extension points:
 
 - `decompose(W)` takes a weight matrix. By default `W = D` (tokens).
 - `order(matchings)` is pluggable.
-- Barrier / reconfiguration delay are flags.
 
 Instance-specific knowledge enters only later, as optimisations through these points (e.g.
 passing a bandwidth-weighted `W`). It never changes the structure of the code.
@@ -153,13 +202,15 @@ passing a bandwidth-weighted `W`). It never changes the structure of the code.
 
 ```text
 decompose(W):                              # W: [n, n] weights; default W = D (tokens)
-    R = W.copy(); matchings = []
-    while R.any():
-        perm = max_weight_perfect_matching(R)        # JV / linear_sum_assignment(maximize=True)
-                                                     # deterministic tie-breaking
+    available = ones(n, n, bool); fill_diagonal(available, False)   # diagonal not routed
+    matchings = []
+    while available.any():
+        # max-weight perfect matching over UNUSED pairs (zero-weight pairs count as edges)
+        cost = where(available, -W, max(W) + 1)       # JV / linear_sum_assignment
+        perm = linear_sum_assignment(cost).col_ind   # deterministic tie-breaking
         matchings.append(perm)
-        R[arange(n), perm] = 0                       # take whole entries (paper Fig. 2h-n)
-    return matchings                                 # ≤ n matchings
+        available[arange(n), perm] = False           # remove used pairs, whatever their weight
+    return matchings                                 # exactly n-1 (residual graph is regular)
 
 order(matchings, D):                        # pluggable; default largest-first
     return sorted(matchings, key=lambda perm: -max_i D[i, perm[i]])   # stable sort
@@ -174,30 +225,35 @@ class MoEDecomposedAlltoAllDispatcher(MoEAlltoAllTokenDispatcher):
       super().__init__(...)
       dispatch_comm = new_group(ep_ranks)            # separate communicators per comm stage:
       combine_comm  = new_group(ep_ranks)            #   no cross-stream NCCL ordering deadlock
+      all_reduce(tiny, dispatch_comm); all_reduce(tiny, combine_comm)   # eager init: all ranks
+                                                     #   must join the first call on a new comm
       s_disp, s_comp, s_comb = Stream(), Stream(), Stream()
       decompose_fn, order_fn = config-selected       # extension points
-      wait_for_slowest, reconfig_delay = config flags
       tau = config                                   # coalescing threshold (tokens):
                                                      #   0 -> one experts() call per matching
                                                      #   inf -> one call at the end (baseline)
-      assert num_local_experts == 1                  # see IMPORTANT note (re-sort per batch)
+      E = num_local_experts                          # >= 1 (see IMPORTANT note at the top)
 
   dispatch_preprocess(h, routing_map, probs):
       x, p = super().dispatch_preprocess(h, routing_map, probs)    # stock permute + metadata
-      D = sum over local experts of num_global_tokens_per_expert   # [n, n], D[src, dst]
-                                                                   # CPU after existing DtoH sync
+      G = num_global_tokens_per_expert.view(n, n, E)  # G[src, dst, e]: CPU, same DtoH copy
+      D = G.sum(-1)                                  # [n, n], D[src, dst]
+      cnt_e = G[:, me, :]                            # [n, E]: tokens from src to my expert e
+                                                     # (the stock path does not DtoH this when
+                                                     #  moe_permute_fusion is on; G covers it)
       schedule = order_fn(decompose_fn(W = D), D)
       send_off = exclusive_cumsum(input_splits)      # x is contiguous per destination (stock)
 
-      # Receive side in SCHEDULE (arrival) order: chunk k = tokens from perm_k.inv[me].
-      # Consecutive matchings are adjacent, so a coalesced batch is one slice. Local to this rank.
-      src_k    = [perm.inv[me] for perm in schedule]
+      # Receive side in SCHEDULE (arrival) order: chunk 0 = local tokens (diagonal, not routed),
+      # chunk k >= 1 = tokens from perm_k.inv[me] (schedule[k-1]).
+      # Consecutive chunks are adjacent, so a coalesced batch is one slice. Local to this rank.
+      src_k    = [me] + [perm.inv[me] for perm in schedule]
       cnt_k    = [output_splits[src_k[k]] for k]
       recv_off = exclusive_cumsum(cnt_k)
 
       # Coalesce consecutive matchings into compute batches of >= tau tokens (CPU, no sync).
       # Batching is per-rank and may differ across ranks: compute is local, and comm order is unaffected.
-      batches = greedy_group(range(len(schedule)), cnt_k, tau)   # list of [k_first .. k_last]
+      batches = greedy_group(range(len(cnt_k)), cnt_k, tau)      # list of [k_first .. k_last]
       return x, p
 
   dispatch_compute_combine(x, p, experts):
@@ -208,30 +264,45 @@ class MoEDecomposedAlltoAllDispatcher(MoEAlltoAllTokenDispatcher):
 
       # Stage 1: dispatch
       with stream(s_disp):
-          for k, perm in enumerate(schedule):
+          for k, perm in enumerate(schedule, start=1):
               dst, src = perm[me], src_k[k]
+              # p2p_batch = batch_isend_irecv: ONE NCCL group, then work.wait() on s_disp.
+              # each op posted only if its count > 0 (both ends read the same D);
+              # no call at all if both are 0 (empty list raises)
               p2p_batch(dispatch_comm,
                         send x[send_off[dst] : +input_splits[dst]] -> dst,
                         send p[same slice]                         -> dst,
                         recv recv_x[recv_off[k] : +cnt_k[k]]       <- src,
                         recv recv_p[same slice]                    <- src)
               ev_disp[k].record()
-              if wait_for_slowest:
-                  stream_barrier(dispatch_comm)      # GPU-side (tiny all-reduce), NOT a host barrier
-                  delay(reconfig_delay)
 
       # Stage 2: expert compute, one call per coalesced batch
       with stream(s_comp):
+          # chunk 0: local tokens, copied on-device (no P2P); ready without waiting on s_disp
+          recv_x[0 : cnt_k[0]] = x[send_off[me] : +input_splits[me]]
+          recv_p[0 : cnt_k[0]] = p[same slice]
           for b, ks in enumerate(batches):
-              s_comp.wait(ev_disp[ks.last])          # s_disp is in-order: last done => all done
+              if ks.last > 0:
+                  s_comp.wait(ev_disp[ks.last])      # s_disp is in-order: last done => all done
               sl  = slice(recv_off[ks.first], recv_off[ks.last] + cnt_k[ks.last])
-              tpe = [sum(cnt_k[k] for k in ks)]      # 1 local expert: single segment
-              y[sl] = experts(recv_x[sl], tpe, recv_p[sl])
-              ev_comp[b].record()
+              tpe = [sum(cnt_e[src_k[k], e] for k in ks) for e in range(E)]   # CPU
+              if sum(tpe) > 0:                       # empty batch: nothing to compute, move on
+                  if E > 1 and len(ks) > 1:
+                      # batch is [src_a: e0..eE | src_b: e0..eE]: expert-sort it (stock
+                      # "permutation 2", sort_chunks_by_idxs on this slice), un-sort after
+                      xs, ps = sort_by_expert(recv_x[sl], recv_p[sl], cnt_e[src_k[ks]])
+                      y[sl] = unsort_by_expert(experts(xs, tpe, ps), cnt_e[src_k[ks]])
+                  else:
+                      # one source chunk is already [e0 | e1 | ...] (stock permutation 1)
+                      y[sl] = experts(recv_x[sl], tpe, recv_p[sl])
+              ev_comp[b].record()                    # recorded even when skipped
 
       # Stage 3: combine (inverse matching, same matching order as dispatch)
       with stream(s_comb):
-          for k, perm in enumerate(schedule):
+          # chunk 0: local result back into the stock layout (no P2P)
+          s_comb.wait(ev_comp[batch_of(0)])
+          out[send_off[me] : +input_splits[me]] = y[0 : cnt_k[0]]
+          for k, perm in enumerate(schedule, start=1):
               dst, src = perm[me], src_k[k]
               s_comb.wait(ev_comp[batch_of(k)])
               p2p_batch(combine_comm,
@@ -268,7 +339,11 @@ Invariants:
 
 - No host sync inside the three loops. All splits and `tpe` are already on the CPU.
 - Every rank issues matchings in the same order on each communicator.
-- With `num_local_experts == 1`, `tpe` is a single count and the second permute step is a no-op.
+- Communication never looks at experts: a chunk is all of `src`'s tokens for this rank, already
+  expert-sorted by the stock permute, exactly as in the stock alltoallv.
+- A batch with one source chunk is already expert-contiguous, so it needs no sort. A batch that
+  spans several sources with `E > 1` is expert-sorted before `experts()` and un-sorted after.
+  With `E == 1`, `tpe` is a single count and no sort is ever needed.
 - The receive buffers (`recv_x`, `recv_p`, `y`) are in schedule order and never leave this
   method. Only `out` is externally visible, and it is in the stock layout.
 - Coalescing only changes compute calls. Dispatch and combine still issue one P2P per matching,
@@ -292,7 +367,17 @@ SYS (through UPI).
 - **Matching order:** largest-first vs Johnson's rule (3-machine flow shop, §3.3) vs as-is.
 - **[testbed] Topology-aware weights:** pass `W = D / bw(i,j)` into `decompose`. Avoid many
   SYS pairs in one matching.
-- **Diagonal `D[i,i]`:** compute local tokens as "matching 0" while matching 1 is in flight.
+- **Diagonal `D[i,i]`:** done: local tokens are chunk 0, computed while matching 1 is in flight.
+- **Send and receive decoupled across matchings:** today a rank's send and receive in matching
+  `k` form one group, so the rank cannot move on until both finish. Issuing sends and receives as
+  separate ordered streams (for example per-direction communicators) would let a rank's send of
+  matching `k+1` start while its receive of matching `k` is still pending. This needs its own
+  deadlock argument; the grouped form is the safe baseline.
+- **Local chunk without copies:** the local chunk is contiguous in `x` (sorted by destination),
+  so `experts()` could read `x[send_off[me] : +input_splits[me]]` and write straight into
+  `out[send_off[me] : ...]`. That saves both copies the stock path also makes. Cost: the chunk
+  can no longer join a coalesced batch, so it is always its own `experts()` call, and τ=None no
+  longer matches the stock GEMM shape (the bitwise test becomes `allclose`). Explore later.
 - **Small-matching merge:** fold matchings below the compute knee (~256 tokens, Fig. 1) into a
   neighbour, or fall back to stock A2A for the residual.
 - **Intra-matching imbalance (§3.3):** split heavy pairs across consecutive matchings.

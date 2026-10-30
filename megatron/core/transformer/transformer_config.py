@@ -978,9 +978,27 @@ class TransformerConfig(ModelParallelConfig):
     specified capacity, similar to GShard, Switch-Transformer, and DeepSpeed-MoE. Note that this is
     currently unsupported so should remain False."""
 
-    moe_token_dispatcher_type: Literal['allgather', 'alltoall', 'flex'] = "allgather"
+    moe_token_dispatcher_type: Literal['allgather', 'alltoall', 'flex', 'decomposed_alltoall'] = (
+        "allgather"
+    )
     """The type of token dispatcher to use. The default is 'allgather'.
-    Options are 'allgather','alltoall' and 'flex'."""
+    Options are 'allgather', 'alltoall', 'flex' and 'decomposed_alltoall'. 'decomposed_alltoall'
+    decomposes the token demand matrix into matchings and pipelines the per-matching P2P
+    dispatch, expert compute and combine."""
+
+    moe_decomposed_coalesce_tokens: Optional[int] = 0
+    """Coalescing threshold (tokens) for the 'decomposed_alltoall' dispatcher. Received chunks are
+    grouped until they hold at least this many tokens, then one expert call runs on the group.
+    0 runs one expert call per matching; None runs a single expert call after the last matching."""
+
+    moe_decomposed_decompose: Literal['greedy_mw'] = 'greedy_mw'
+    """Decomposition of the token demand matrix into matchings for the 'decomposed_alltoall'
+    dispatcher. 'greedy_mw' takes, per round, the maximum-weight perfect matching among the rank
+    pairs not yet used (off-diagonal), giving exactly ep_size - 1 matchings."""
+
+    moe_decomposed_order: Literal['largest_first', 'as_is'] = 'largest_first'
+    """Order in which the 'decomposed_alltoall' dispatcher issues the matchings. 'largest_first'
+    sorts by the largest pair in each matching; 'as_is' keeps the decomposition order."""
 
     moe_enable_deepep: bool = False
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
@@ -1600,6 +1618,47 @@ class TransformerConfig(ModelParallelConfig):
                 f"tensor-parallel size, got {self.tensor_model_parallel_size}."
             )
 
+    def _validate_decomposed_alltoall(self) -> None:
+        """Validate settings for moe_token_dispatcher_type='decomposed_alltoall'."""
+        prefix = "moe_token_dispatcher_type='decomposed_alltoall'"
+        if self.num_moe_experts is None:
+            raise ValueError(f"{prefix} requires num_moe_experts.")
+        if self.expert_model_parallel_size <= 1:
+            raise ValueError(f"{prefix} requires expert_model_parallel_size > 1.")
+        if self.tensor_model_parallel_size != 1 or self.expert_tensor_parallel_size not in (
+            None,
+            1,
+        ):
+            raise ValueError(
+                f"{prefix} requires tensor_model_parallel_size == 1 and "
+                "expert_tensor_parallel_size == 1."
+            )
+        if self.cuda_graph_impl != "none" or self.enable_cuda_graph or self.external_cuda_graph:
+            raise ValueError(f"{prefix} does not support CUDA graphs; use cuda_graph_impl='none'.")
+        if self.moe_pad_expert_input_to_capacity or self.moe_expert_capacity_factor is not None:
+            raise ValueError(
+                f"{prefix} requires dropless routing (moe_expert_capacity_factor=None, "
+                "moe_pad_expert_input_to_capacity=False)."
+            )
+        if self.transformer_impl == "inference_optimized":
+            raise ValueError(
+                f"{prefix} is not supported with transformer_impl='inference_optimized', which "
+                "replaces the token dispatcher during inference."
+            )
+        if self.moe_shared_expert_overlap or self.overlap_moe_expert_parallel_comm:
+            raise ValueError(
+                f"{prefix} does not support moe_shared_expert_overlap or "
+                "overlap_moe_expert_parallel_comm."
+            )
+        if (
+            self.moe_decomposed_coalesce_tokens is not None
+            and self.moe_decomposed_coalesce_tokens < 0
+        ):
+            raise ValueError(
+                "moe_decomposed_coalesce_tokens must be None or >= 0, got "
+                f"{self.moe_decomposed_coalesce_tokens}."
+            )
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
@@ -2124,6 +2183,9 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_flex_dispatcher_backend='ncclep' requires "
                     "moe_token_dispatcher_type='flex'."
                 )
+
+        if self.moe_token_dispatcher_type == "decomposed_alltoall":
+            self._validate_decomposed_alltoall()
 
         if self.moe_dispatch_fwd_dtype != 'bf16' or self.moe_combine_bwd_dtype != 'bf16':
             if (
