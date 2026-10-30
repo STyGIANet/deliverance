@@ -66,13 +66,13 @@ Implementation plan: [decomposed-a2a-plan.md](decomposed-a2a-plan.md).
       Fig. 1 fixed overhead) so the user can decide on chunk granularity. Decided: option B (τ).
 - [x] Confirm the schedule-order receive buffer, then update the pseudocode (τ coalescing +
       schedule-order `recv_off`).
-- [ ] Register the new dispatcher type (`--moe-token-dispatcher-type`) and route `MoELayer` to it.
+- [x] Register the new dispatcher type (`--moe-token-dispatcher-type`) and route `MoELayer` to it.
 
 ### Launcher / run setup (later)
 
 - [x] Run with EP=8: `run_moe_inference.sh` takes `--tp/--pp/--ep` (default 1/1/8) and
       prepares the checkpoint from HF on first use ([moe-inference.md](moe-inference.md)).
-- [ ] Select the new dispatcher type from the launcher: `--dispatcher` passes
+- [x] Select the new dispatcher type from the launcher: `--dispatcher` passes
       `--moe-token-dispatcher-type` through; it works once the type is registered.
 - [x] Get an EP=8 Mixtral 8×7B checkpoint: converted to legacy TP=1/PP=1/EP=8
       (`/depot/shared/megatron-checkpoints/mixtral-8x7b-v0.1-tp1-pp1-ep8`). Token IDs match the

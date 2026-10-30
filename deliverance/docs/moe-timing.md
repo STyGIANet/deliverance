@@ -268,7 +268,8 @@ Observed in the first real run (TP=4, EP=1):
 - [x] Unit tests: `tests/unit_tests/transformer/moe/test_moe_timing.py`.
 - [ ] Hooks inside `dispatch_compute_combine` (per matching / per batch) + `schedule_cpu`.
 - [x] NVTX ranges with matching tags.
-- [ ] Run `test_moe_layer.py` on all 8 GPUs (20 cases need world size 8; only checked on 4 so far).
+- [x] Run `test_moe_layer.py` on all 8 GPUs (20 cases need world size 8). 2026-10-29, together
+      with `test_decomposed_config.py`: 79 passed, 8 skipped, 0 failed on every rank.
 - [x] Offline analysis script: metrics table (`analyse_moe_timing.py`).
 - [ ] Compute cost curve (`compute[b]` duration vs tokens), once the decomposed path exists.
 - [ ] Decide on a real warmup in `offline_inference.py` (throw-away `generate`, record warmup step

@@ -27,6 +27,7 @@ from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEAllGatherTokenDispatcher,
     MoEAlltoAllTokenDispatcher,
+    MoEDecomposedAlltoAllDispatcher,
     MoEFlexTokenDispatcher,
     MoETokenDispatcher,
 )
@@ -350,6 +351,13 @@ class MoELayer(BaseMoELayer):
             )
         elif config.moe_token_dispatcher_type == "alltoall":
             self.token_dispatcher = MoEAlltoAllTokenDispatcher(
+                self.num_local_experts,
+                self.local_expert_indices,
+                config=self.config,
+                pg_collection=pg_collection,
+            )
+        elif config.moe_token_dispatcher_type == "decomposed_alltoall":
+            self.token_dispatcher = MoEDecomposedAlltoAllDispatcher(
                 self.num_local_experts,
                 self.local_expert_indices,
                 config=self.config,
@@ -705,6 +713,11 @@ class MoELayer(BaseMoELayer):
             else:
                 self.token_dispatcher = self._training_token_dispatcher
                 self.shared_expert_overlap = self.config.moe_shared_expert_overlap
+        # The config rejects inference_optimized for this dispatcher; guard against the swap
+        # above replacing it anyway.
+        assert self.config.moe_token_dispatcher_type != "decomposed_alltoall" or isinstance(
+            self.token_dispatcher, MoEDecomposedAlltoAllDispatcher
+        ), f"decomposed_alltoall dispatcher was replaced by {type(self.token_dispatcher).__name__}"
 
         # Per-phase timing (MOE_PHASE_TIMING_DIR). Only whole forward passes are timed: partial
         # CUDA-graph execution and recompute would produce incomplete or duplicate records.

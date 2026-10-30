@@ -159,6 +159,12 @@ bash deliverance/scripts/run_moe_inference.sh \
   --dispatcher decomposed_alltoall
 ```
 
+**Status (2026-10-29): done.** The branch is in `MoELayer.__init__`, and `forward` asserts that
+the dispatcher was not swapped out. Mixtral 8×7B, EP=8, 4 gsm8k prompts, 8 new tokens:
+`generated_tokens` identical to `alltoall` for all 4 prompts, and all 608 timing rows report
+`MoEDecomposedAlltoAllDispatcher`. Regression: `test_moe_layer.py` + `test_decomposed_config.py`
+on 8 GPUs, 79 passed, 8 skipped.
+
 Expected: same generated text as `--dispatcher alltoall`. The timing `path` field reads
 `MoEDecomposedAlltoAllDispatcher` when `--timing-dir` is set.
 
