@@ -209,6 +209,27 @@ Unit tests (`test_decomposition.py`):
 python -m pytest -q -p no:cacheprovider tests/unit_tests/transformer/moe/test_decomposition.py
 ```
 
+**Status (2026-10-30): done.** `megatron/core/transformer/moe/decomposition.py`:
+
+- `greedy_maxweight_decompose(W)` follows the agreed max-weight algorithm with the diagonal
+  disabled. It returns the permutations (`col_ind`) rather than per-round amount matrices; a
+  round's amounts are `W[arange(n), perm]`. There is no `bytes_per_token` argument: any weighting
+  enters through `W`.
+- `order_largest_first` and `order_as_is`.
+- `DECOMPOSE_FNS` and `ORDER_FNS` map the config choices to these functions; a test keeps them in
+  sync with the config `Literal`s.
+- scipy is imported inside the function.
+
+Tests: 31 passed. They cover:
+
+- each off-diagonal pair in exactly one of the `n − 1` matchings, at `n` = 2–16 and densities 0–1
+- every round is the true max-weight matching over the unused pairs (brute force at `n = 5`)
+- a hand-checked 3×3 case, diagonal-only input, determinism, trivial sizes, ordering stability
+
+A one-off check against the reference implementation gave identical rounds on 4,000 random
+matrices. Determinism across ranks also assumes the same scipy build on every rank, which holds
+on one node with one venv.
+
 ## Step 4: Dispatcher preprocessing
 
 In `MoEDecomposedAlltoAllDispatcher`:

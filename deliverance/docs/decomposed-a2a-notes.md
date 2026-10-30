@@ -89,7 +89,7 @@ Implementation plan: [decomposed-a2a-plan.md](decomposed-a2a-plan.md).
 
 ### Implementation
 
-- [ ] Decomposition + ordering function (CPU, deterministic).
+- [x] Decomposition + ordering function (CPU, deterministic): `moe/decomposition.py`.
 - [ ] `dispatch_compute_combine()` with dispatch / compute / combine streams.
 - [ ] Separate NCCL communicators for dispatch and combine.
 - [ ] `MoELayer.forward` hook.
