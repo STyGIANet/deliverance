@@ -104,17 +104,6 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.run --nproc-per-node 4 
 Expected on 4 GPUs: `20 failed, 49 passed, 8 skipped`. All 20 failures are
 `world_size (4) is not divisible by ... (8)`. Those cases need `--nproc-per-node 8`.
 
-To reproduce the baseline comparison:
-
-```bash
-git stash push -m "moe-timing hooks" -- megatron/core/transformer/moe/moe_layer.py
-# run the test_moe_layer.py command above (without test_moe_timing.py) -> 20 failed, 43 passed, 8 skipped
-git stash pop
-```
-
-Requires the `test` dependency group (`uv pip install --group test`). `install.sh` does not
-install it.
-
 ### Formatting
 
 isort/black are not in the venv. Run them ephemerally at the versions pinned in `pyproject.toml`:
