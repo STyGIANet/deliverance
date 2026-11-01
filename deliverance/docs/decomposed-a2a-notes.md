@@ -37,6 +37,37 @@ Implementation plan: [decomposed-a2a-plan.md](decomposed-a2a-plan.md).
 >    but compute efficiency depends on tokens per (batch, expert). A decomposition that is good at
 >    rank level can still fragment expert compute. This is the same fragmentation the paper
 >    attributes to BvN, one level down.
+>
+> **Note** What happens in round k, i->j and j -> l. j's combine is j->i. Suppose in k+1, j->i. That means i recv j. How does that affect the buffers of i? Race condition?
+>
+> **Answer (2026-11-01).** No race. Rank i receives from j twice, possibly at the same time:
+>
+> - j's combine of round k (i's own tokens, computed) arrives on `combine_group` and lands in
+>   `out[send_off[j] : +input_splits[j]]`.
+> - j's dispatch of round k+1 (j's tokens for i) arrives on `dispatch_group` and lands in j's
+>   receive chunk of `recv_tokens`.
+>
+> The buffers are disjoint, and NCCL keeps the messages apart by **communicator**. NCCL P2P has
+> no tags: a receive matches a send by (communicator, peer, issue order of that pair and
+> direction on that communicator) only, never by size. Experiment (2 ranks, same-size X then Y,
+> receiver posts Y's receive first; reproduced 4 times):
+>
+> ```text
+> two communicators: buffer for X got [1.0], buffer for Y got [2.0] -> correct
+> one communicator : buffer for X got [2.0], buffer for Y got [1.0] -> SWAPPED
+> ```
+>
+> On one communicator, order is the only discriminator and same-size messages swap silently.
+> Our code issues all dispatch before any combine, identically on every rank. On a shared
+> communicator it would therefore still be correct, but serialized (the PG runs its P2P on one
+> NCCL stream). Separate communicators are needed for correctness whenever issue order could
+> differ across ranks, and for overlap always.
+>
+> Tests:
+>
+> - `test_reverse_pair_in_next_round` forces the pattern on every rank (schedule +1, −1, +2, …)
+>   and both arrival orders (GPU sleeps); bitwise equal to the undelayed run.
+> - `TestP2PMatchingAssumptions` pins down the matching semantics above.
 
 ## Decisions
 
@@ -96,11 +127,10 @@ Implementation plan: [decomposed-a2a-plan.md](decomposed-a2a-plan.md).
 
 ### Validation
 
-- [x] Unit test vs `MoEAlltoAllTokenDispatcher` on random routing (EP=8): bitwise-equal at
+- [ ] Unit test vs `MoEAlltoAllTokenDispatcher` on random routing (EP=8): bitwise-equal at
       τ=∞ (same GEMM shape as stock). Otherwise allclose, because different batch sizes can make
       cuBLAS/TE pick different kernels and accumulation orders.
-- [x] End-to-end Mixtral 8×7B generation matches stock alltoall outputs (4 gsm8k prompts,
-      8 tokens, τ=0 and τ=1e9; a larger prompt set is still to do in step 8).
+- [ ] End-to-end Mixtral 8×7B generation matches stock alltoall outputs.
 - [ ] Nsight Systems trace confirms dispatch/compute/combine actually overlap.
 
 ### Deferred tunables
@@ -135,6 +165,37 @@ Implementation plan: [decomposed-a2a-plan.md](decomposed-a2a-plan.md).
   progresses both by contract. NCCL's blocking (a spinning kernel, no backoff or retry, abort
   on the watchdog timeout) is the intended behaviour. Matchings never interleave on a rank:
   groups on one communicator run in issue order on its NCCL stream.
+- **P2P connections are set up on first use, and that blocks the host.** The eager all-reduce
+  sets up collective connections only. NCCL connects each P2P pair the first time it is used, and
+  the setup waits on the CPU until the peer sets up the same pair on the same communicator. In
+  the experiment above, rank 0 first used communicator A while rank 1 first used B, and both
+  hung. Before the fix, the dispatcher was safe only because every rank first touches each pair
+  in the same schedule order. It was fragile, and connection setup landed inside the timed
+  region. Two ways out:
+  1. **Chosen: warm up every directed pair in `__init__`** (`_warm_up_p2p`). For each
+     communicator, shifts s = 1…n−1, each one grouped send to r+s + receive from r−s, in the same
+     order on every rank. Verified 2026-11-01. With the warm-up patched out,
+     `test_warm_up_allows_any_first_use_order` hangs (killed at 120 s); with it, it passes. The
+     full suite passes (199 passed, 12 skipped), and an end-to-end Mixtral run, where
+     communicators come from `ncclCommSplit`, gives tokens identical to stock.
+  2. **Alternative: `NCCL_RUNTIME_CONNECT=0`**, so NCCL connects all peers when the communicator
+     is created. No code needed, but it depends on the NCCL version (the variable must exist and
+     behave this way in the installed NCCL) and on the environment of every launch. Forgetting it
+     brings the hazard back silently. It also connects every pair of *every* communicator,
+     including the stock ones, which costs more memory and init time. See the testbed checklist
+     item on `NCCL_RUNTIME_CONNECT=0`.
+- **Creating groups: only safe today because EP spans the whole world.**
+  - **The split.** Megatron binds `device_id`, so PyTorch builds every `new_group` with
+    `ncclCommSplit` from the default communicator. That call is collective over **all** world
+    ranks.
+  - **Why it is fine now.** The dispatcher creates its two groups with
+    `use_local_synchronization=True`, called by EP members only. With EP = 8 = world, every rank
+    calls it.
+  - **When it would hang.** With more than one EP group (world > EP), each group's members would
+    call the split separately, which may hang. Revisit before running with world > EP.
+  - **Group counters.** Every rank must create groups in the same order. A test that created
+    groups on ranks 0 and 1 only hung the next test's group creation, because those ranks'
+    group counters ran ahead.
 - **`batch_isend_irecv([])` raises** (it reads `p2p_op_list[0]`). When both of a rank's counts
   in a matching are 0, make no call for that matching (the per-op rule below).
 - **Every rank must take part in the first call on a new communicator.** PyTorch:

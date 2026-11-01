@@ -1035,8 +1035,39 @@ class MoEDecomposedAlltoAllDispatcher(MoEAlltoAllTokenDispatcher):
                 torch.distributed.all_reduce(
                     torch.zeros(1, device=torch.cuda.current_device()), group=group
                 )
+            # The all-reduce sets up collective connections only. NCCL sets up each P2P connection
+            # on first use, and that setup blocks the host until the peer sets up the same pair
+            # on the same communicator: ranks that first touch the two communicators in
+            # different orders hang. Connect every directed pair now, in one fixed order.
+            for group in groups:
+                cls._warm_up_p2p(group, list(ranks))
+            torch.cuda.synchronize()
             cls._comm_groups[key] = groups
         return cls._comm_groups[key]
+
+    @staticmethod
+    def _warm_up_p2p(group, ranks: List[int]) -> None:
+        """Exchange one element with every peer: shift s pairs each rank with r + s and r - s.
+
+        Each shift is one grouped send + receive (no cyclic wait), issued in the same order on
+        every rank, so all n * (n - 1) directed connections exist before the first forward.
+        """
+        n = len(ranks)
+        me = ranks.index(torch.distributed.get_rank())
+        device = torch.cuda.current_device()
+        for shift in range(1, n):
+            send = torch.zeros(1, device=device)
+            recv = torch.empty(1, device=device)
+            ops = [
+                torch.distributed.P2POp(
+                    torch.distributed.isend, send, peer=ranks[(me + shift) % n], group=group
+                ),
+                torch.distributed.P2POp(
+                    torch.distributed.irecv, recv, peer=ranks[(me - shift) % n], group=group
+                ),
+            ]
+            for work in torch.distributed.batch_isend_irecv(ops):
+                work.wait()
 
     def _maybe_dtoh_and_synchronize(
         self, point: str, tokens_per_expert: Optional[torch.Tensor] = None
