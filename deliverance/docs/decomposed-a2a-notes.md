@@ -90,16 +90,17 @@ Implementation plan: [decomposed-a2a-plan.md](decomposed-a2a-plan.md).
 ### Implementation
 
 - [x] Decomposition + ordering function (CPU, deterministic): `moe/decomposition.py`.
-- [ ] `dispatch_compute_combine()` with dispatch / compute / combine streams.
-- [ ] Separate NCCL communicators for dispatch and combine.
-- [ ] `MoELayer.forward` hook.
+- [x] `dispatch_compute_combine()` with dispatch / compute / combine streams.
+- [x] Separate NCCL communicators for dispatch and combine (shared across layers, eager init).
+- [x] `MoELayer.forward` hook.
 
 ### Validation
 
-- [ ] Unit test vs `MoEAlltoAllTokenDispatcher` on random routing (EP=8): bitwise-equal at
+- [x] Unit test vs `MoEAlltoAllTokenDispatcher` on random routing (EP=8): bitwise-equal at
       τ=∞ (same GEMM shape as stock). Otherwise allclose, because different batch sizes can make
       cuBLAS/TE pick different kernels and accumulation orders.
-- [ ] End-to-end Mixtral 8×7B generation matches stock alltoall outputs.
+- [x] End-to-end Mixtral 8×7B generation matches stock alltoall outputs (4 gsm8k prompts,
+      8 tokens, τ=0 and τ=1e9; a larger prompt set is still to do in step 8).
 - [ ] Nsight Systems trace confirms dispatch/compute/combine actually overlap.
 
 ### Deferred tunables

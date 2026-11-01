@@ -333,6 +333,38 @@ Tests:
 - With τ=None, run step 6's bitwise test.
 - Run 100 iterations without a hang at τ=0 and τ=None.
 
+**Status (2026-11-01): done.**
+
+Code (`token_dispatcher.py`, `moe_layer.py`):
+
+- **Shared resources.** The dispatch and combine communicators are created once per EP group
+  and shared by all MoE layers. They use `new_group(..., use_local_synchronization=True)`, so only
+  EP members call it, and each is initialised eagerly with a tiny all-reduce. The three streams
+  are class-level, like the stock `cuda_dtoh_stream`.
+- **`_p2p()`.** One `batch_isend_irecv` per matching, with each op posted by its own count, no
+  call when the list is empty, and `work.wait()` on the issuing stream. Peers are given as global
+  ranks.
+- **`dispatch_compute_combine()`** follows the notes' pseudocode:
+  - chunk 0 is local, copied on the compute stream
+  - empty batches are skipped and still record their event
+  - with E > 1, a batch spanning several sources is expert-sorted and un-sorted with the stock
+    `sort_chunks_by_idxs` (CPU split sizes, no host sync)
+  - expert outputs are kept per batch, and combine sends slices of them (no copy into a
+    receive-order `y`)
+  - main joins the combine stream, which transitively joins the other two
+- **No `record_stream`.** Every side-stream buffer stays referenced until main joins, and later
+  reuse on a side stream comes after a wait on main.
+- **Forward only:** the method asserts there is no autograd.
+- **`MoELayer.forward`** calls it instead of dispatch → routed_experts_compute → combine.
+  Per-matching timing is not wired yet (step 7); `n_tokens_recv` is set.
+
+τ = ∞ on the command line: `Optional[int]` becomes a plain `int` flag, so `None` cannot be passed.
+A τ larger than any token count (e.g. `--moe-decomposed-coalesce-tokens 1000000000`) gives the
+same single batch.
+
+End-to-end (Mixtral, EP=8, step 2 prompts): `generated_tokens` identical to stock at τ=0 and at
+τ=1e9.
+
 ## Step 6: Correctness tests
 
 `tests/unit_tests/transformer/moe/test_decomposed_dispatcher.py`, modelled on
@@ -361,6 +393,29 @@ python -m torch.distributed.run --nproc-per-node 8 \
   tests/unit_tests/transformer/moe/test_moe_layer.py \
   tests/unit_tests/transformer/moe/test_a2a_token_dispatcher.py
 ```
+
+**Status (2026-11-01): done, with gaps.** `TestDecomposedDispatcherForward` compares full
+`MoELayer` forwards, stock against decomposed, with identical weights and bf16 inputs. Each rank
+gets a different token count, and each decomposed layer runs twice to exercise reuse of the
+shared streams and communicators.
+
+| Case | Result |
+| --- | --- |
+| τ=None × E ∈ {1, 2, 4} × SequentialMLP / grouped GEMM | **bitwise equal** to stock |
+| τ ∈ {0, 48} × E ∈ {1, 2, 4} × both expert types | `allclose` |
+| one rank with 64 tokens and the rest with 1 (empty pairs, empty matchings, send-only and receive-only matchings), τ ∈ {0, None}, E = 4 | `allclose` |
+
+20 passed. Full regression (all decomposed tests, `test_a2a_token_dispatcher.py`,
+`test_moe_layer.py`) on 8 GPUs: 195 passed, 12 skipped.
+
+Not yet covered by a dedicated test:
+
+- a rank with 0 tokens
+- only local tokens (diagonal-only `D`)
+- all tokens to one expert
+- an explicit 100-iteration hang check
+
+Each end-to-end run does about 600 layer forwards (19 steps × 32 layers) without a hang.
 
 ## Step 7: Timing hooks in the decomposed path
 
