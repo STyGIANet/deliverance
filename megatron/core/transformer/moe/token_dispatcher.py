@@ -965,6 +965,15 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
 
 class MoEDecomposedAlltoAllDispatcher(MoEAlltoAllTokenDispatcher):
+    # Shared by all MoE layers. Layers run one after another, so every rank still issues the ops
+    # on each communicator in the same order, and one set avoids 2 communicators per layer.
+    # Dispatch and combine use separate communicators: they run on different streams, and ops on
+    # a shared communicator could be issued in different orders on different ranks.
+    _comm_groups = {}
+    dispatch_stream = None
+    compute_stream = None
+    combine_stream = None
+
     def __init__(
         self,
         num_local_experts: int,
@@ -1001,6 +1010,33 @@ class MoEDecomposedAlltoAllDispatcher(MoEAlltoAllTokenDispatcher):
         # Compute batches as inclusive (first, last) chunk ranges, and the batch of each chunk.
         self.batches = None
         self.batch_of_chunk = None
+
+        # Global ranks of the EP group, indexed by EP rank (the src/dst indices of the schedule).
+        self.ep_global_ranks = torch.distributed.get_process_group_ranks(self.ep_group)
+        self.dispatch_group, self.combine_group = self._get_comm_groups(self.ep_global_ranks)
+        if MoEDecomposedAlltoAllDispatcher.dispatch_stream is None:
+            MoEDecomposedAlltoAllDispatcher.dispatch_stream = torch.cuda.Stream()
+            MoEDecomposedAlltoAllDispatcher.compute_stream = torch.cuda.Stream()
+            MoEDecomposedAlltoAllDispatcher.combine_stream = torch.cuda.Stream()
+
+    @classmethod
+    def _get_comm_groups(cls, ranks: List[int]):
+        """Create (once per EP group) the dispatch and combine communicators."""
+        key = tuple(ranks)
+        if key not in cls._comm_groups:
+            # Only the EP members create (and must create) these groups.
+            groups = tuple(
+                torch.distributed.new_group(ranks=list(ranks), use_local_synchronization=True)
+                for _ in range(2)
+            )
+            # Eager init: every rank of a group must take part in its first NCCL call, and the
+            # zero-count rule means not every rank posts P2P in the first matching.
+            for group in groups:
+                torch.distributed.all_reduce(
+                    torch.zeros(1, device=torch.cuda.current_device()), group=group
+                )
+            cls._comm_groups[key] = groups
+        return cls._comm_groups[key]
 
     def _maybe_dtoh_and_synchronize(
         self, point: str, tokens_per_expert: Optional[torch.Tensor] = None
@@ -1039,7 +1075,7 @@ class MoEDecomposedAlltoAllDispatcher(MoEAlltoAllTokenDispatcher):
             n, n, num_local
         )
         self.demand = counts.sum(axis=-1)
-        self.tokens_per_src_expert = counts[:, me, :] # All tokens this rank receives
+        self.tokens_per_src_expert = counts[:, me, :]  # All tokens this rank receives
         self.schedule = self.order_fn(self.decompose_fn(self.demand), self.demand)
 
         input_splits = np.asarray(self.input_splits, dtype=np.int64)
@@ -1052,6 +1088,169 @@ class MoEDecomposedAlltoAllDispatcher(MoEAlltoAllTokenDispatcher):
         self.batch_of_chunk = [
             b for b, (first, last) in enumerate(self.batches) for _ in range(first, last + 1)
         ]
+
+    def _p2p(self, group, sends, recvs) -> None:
+        """Issue one matching's sends and receives as ONE NCCL group on the current stream.
+
+        A matching is a permutation, so this rank's send peer and receive peer usually differ;
+        only a grouped call rules out the cyclic send-before-receive deadlock. Each op is posted
+        only if it moves tokens. Both ends read the same demand matrix, so they always agree.
+        """
+        ops = [
+            torch.distributed.P2POp(
+                torch.distributed.isend, t, peer=self.ep_global_ranks[peer], group=group
+            )
+            for peer, tensors in sends
+            for t in tensors
+        ] + [
+            torch.distributed.P2POp(
+                torch.distributed.irecv, t, peer=self.ep_global_ranks[peer], group=group
+            )
+            for peer, tensors in recvs
+            for t in tensors
+        ]
+        if not ops:
+            return  # batch_isend_irecv([]) raises
+        # The work runs on PyTorch's internal NCCL stream; wait() makes the current stream wait
+        # on it on the GPU, without blocking the CPU.
+        for work in torch.distributed.batch_isend_irecv(ops):
+            work.wait()
+
+    def _chunk_slice(self, k: int) -> slice:
+        """Rows of receive chunk k in the receive buffer."""
+        return slice(self.recv_offsets[k], self.recv_offsets[k] + self.recv_counts[k])
+
+    def _send_slice(self, dst: int) -> slice:
+        """Rows of the permuted input (stock layout) destined for EP rank dst."""
+        return slice(self.send_offsets[dst], self.send_offsets[dst] + int(self.input_splits[dst]))
+
+    def _run_experts(self, experts, tokens, probs, counts):
+        """Run the local experts on one compute batch.
+
+        Args:
+            tokens, probs: the batch, in receive-chunk order.
+            counts: [chunks in batch, num_local_experts] tokens per (source chunk, expert).
+        """
+        tokens_per_expert = torch.from_numpy(counts.sum(axis=0))
+        num_chunks, num_local = counts.shape
+        if num_local > 1 and num_chunks > 1:
+            # [src_a: e0, e1 | src_b: e0, e1] -> [e0: src_a, src_b | e1: src_a, src_b]. A single
+            # source chunk is already expert-sorted by the stock permute.
+            chunk_major = torch.arange(num_chunks * num_local).reshape(num_chunks, num_local)
+            tokens, probs = sort_chunks_by_idxs(
+                tokens, torch.from_numpy(counts.ravel()), chunk_major.T.ravel(), probs=probs
+            )
+            output, mlp_bias = experts(tokens, tokens_per_expert, probs)
+            # Back: piece (e, src) sits at index e * num_chunks + src in expert-major order.
+            expert_major = torch.arange(num_local * num_chunks).reshape(num_local, num_chunks)
+            output, _ = sort_chunks_by_idxs(
+                output, torch.from_numpy(counts.T.ravel()), expert_major.T.ravel()
+            )
+        else:
+            output, mlp_bias = experts(tokens, tokens_per_expert, probs)
+        assert mlp_bias is None, "mlp_bias is not supported for MoEDecomposedAlltoAllDispatcher"
+        return output
+
+    def dispatch_compute_combine(
+        self, permuted_tokens: torch.Tensor, permuted_probs: torch.Tensor, experts
+    ) -> torch.Tensor:
+        """Dispatch, expert compute and combine, pipelined over the matchings.
+
+        Replaces token_dispatch -> dispatch_postprocess -> experts -> combine_preprocess ->
+        token_combine. Three side streams run dispatch(k+1) || compute(b) || combine(k-1); ranks
+        wait only on their P2P partners, with no barrier between matchings. Forward only.
+
+        Args:
+            permuted_tokens, permuted_probs: output of dispatch_preprocess (stock layout).
+            experts: the layer's expert module.
+
+        Returns:
+            Combined expert outputs in the stock layout, for combine_postprocess().
+        """
+        assert (
+            not torch.is_grad_enabled() or not permuted_tokens.requires_grad
+        ), "MoEDecomposedAlltoAllDispatcher is forward-only (inference)"
+        me = self.ep_rank
+        main = torch.cuda.current_stream()
+        total_recv = self.recv_offsets[-1] + self.recv_counts[-1]
+        # Receive buffers in schedule order (chunk 0 = local). They never leave this method.
+        recv_tokens = permuted_tokens.new_empty((total_recv, permuted_tokens.shape[-1]))
+        recv_probs = permuted_probs.new_empty((total_recv,))
+        # Combine result in the stock layout.
+        out = torch.empty_like(permuted_tokens)
+        # Expert output per compute batch, in receive-chunk order; combine sends slices of it.
+        batch_outputs = [None] * len(self.batches)
+        dispatch_done = [None] + [torch.cuda.Event() for _ in self.schedule]
+        compute_done = [torch.cuda.Event() for _ in self.batches]
+        for stream in (self.dispatch_stream, self.compute_stream, self.combine_stream):
+            stream.wait_stream(main)
+
+        # Stage 1: dispatch, one grouped P2P per matching.
+        with torch.cuda.stream(self.dispatch_stream):
+            for k, perm in enumerate(self.schedule, start=1):
+                dst, src = int(perm[me]), self.recv_src[k]
+                send = self._send_slice(dst)
+                recv = self._chunk_slice(k)
+                self._p2p(
+                    self.dispatch_group,
+                    sends=(
+                        [(dst, (permuted_tokens[send], permuted_probs[send]))]
+                        if send.stop > send.start
+                        else []
+                    ),
+                    recvs=(
+                        [(src, (recv_tokens[recv], recv_probs[recv]))]
+                        if recv.stop > recv.start
+                        else []
+                    ),
+                )
+                dispatch_done[k].record()
+
+        # Stage 2: expert compute, one call per coalesced batch; empty batches are skipped.
+        with torch.cuda.stream(self.compute_stream):
+            # Chunk 0: local tokens (not routed), copied so batches stay one slice.
+            local = self._chunk_slice(0)
+            recv_tokens[local].copy_(permuted_tokens[self._send_slice(me)])
+            recv_probs[local].copy_(permuted_probs[self._send_slice(me)])
+            for b, (first, last) in enumerate(self.batches):
+                if last > 0:
+                    # The dispatch stream is in order: chunk `last` done => all earlier done.
+                    self.compute_stream.wait_event(dispatch_done[last])
+                rows = slice(self.recv_offsets[first], self._chunk_slice(last).stop)
+                if rows.stop > rows.start:
+                    counts = self.tokens_per_src_expert[self.recv_src[first : last + 1]]
+                    batch_outputs[b] = self._run_experts(
+                        experts, recv_tokens[rows], recv_probs[rows], counts
+                    )
+                compute_done[b].record()  # also when skipped, so combine's waits stay uniform
+
+        # Stage 3: combine, the inverse of each matching, in the same order as dispatch.
+        with torch.cuda.stream(self.combine_stream):
+
+            def chunk_output(k):
+                b = self.batch_of_chunk[k]
+                start = self.recv_offsets[k] - self.recv_offsets[self.batches[b][0]]
+                return batch_outputs[b][start : start + self.recv_counts[k]]
+
+            self.combine_stream.wait_event(compute_done[self.batch_of_chunk[0]])
+            if self.recv_counts[0] > 0:
+                out[self._send_slice(me)].copy_(chunk_output(0))
+            for k, perm in enumerate(self.schedule, start=1):
+                dst, src = int(perm[me]), self.recv_src[k]
+                self.combine_stream.wait_event(compute_done[self.batch_of_chunk[k]])
+                back = self._send_slice(dst)
+                self._p2p(
+                    self.combine_group,
+                    sends=[(src, (chunk_output(k),))] if self.recv_counts[k] > 0 else [],
+                    recvs=[(dst, (out[back],))] if back.stop > back.start else [],
+                )
+
+        # Joining the combine stream joins all three: it waited on the last compute batch, which
+        # waited on the last matching's dispatch. Buffers allocated on the side streams stay
+        # referenced until here, and later reuse on those streams follows a wait on main, so no
+        # record_stream is needed.
+        main.wait_stream(self.combine_stream)
+        return out
 
 
 class _DispatchManager(ABC):

@@ -762,19 +762,29 @@ class MoELayer(BaseMoELayer):
                 if intermediate_tensors is not None:
                     hidden_states, probs = intermediate_tensors
 
-                with moe_phase(timing, "dispatch") as interval:
-                    dispatched_input, probs = self.dispatch(hidden_states, probs)
-                    interval.tokens = dispatched_input.shape[0]
-                if timing is not None:
-                    timing.n_tokens_recv = dispatched_input.shape[0]
-                with moe_phase(timing, "compute", tokens=dispatched_input.shape[0]):
-                    output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
-                assert (
-                    mlp_bias is None
-                ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
-                with moe_phase(timing, "combine") as interval:
-                    output = self.combine(output)
-                    interval.tokens = output.shape[0]
+                if isinstance(self.token_dispatcher, MoEDecomposedAlltoAllDispatcher):
+                    # Dispatch, expert compute and combine pipelined per matching on side
+                    # streams (no separate blocking phases). Per-matching timing: step 7.
+                    output = self.token_dispatcher.dispatch_compute_combine(
+                        hidden_states, probs, self.experts
+                    )
+                    mlp_bias = None
+                    if timing is not None:
+                        timing.n_tokens_recv = sum(self.token_dispatcher.recv_counts)
+                else:
+                    with moe_phase(timing, "dispatch") as interval:
+                        dispatched_input, probs = self.dispatch(hidden_states, probs)
+                        interval.tokens = dispatched_input.shape[0]
+                    if timing is not None:
+                        timing.n_tokens_recv = dispatched_input.shape[0]
+                    with moe_phase(timing, "compute", tokens=dispatched_input.shape[0]):
+                        output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
+                    assert (
+                        mlp_bias is None
+                    ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
+                    with moe_phase(timing, "combine") as interval:
+                        output = self.combine(output)
+                        interval.tokens = output.shape[0]
 
                 if intermediate_tensors is not None:
                     return output, mlp_bias
