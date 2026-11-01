@@ -161,9 +161,14 @@ Implementation plan: [decomposed-a2a-plan.md](decomposed-a2a-plan.md).
   serialization across streams here. It would matter on Hopper/Ampere, where `=1` funnels every
   stream into one queue and CPU issue order then decides the overlap.
 - **D is almost free.** `preprocess()` all-gathers per-expert counts over the TP×EP group
-  (`num_global_tokens_per_expert`), but that tensor is a local variable. The existing DtoH copy
-  only brings this rank's row (`input_splits`) and column (`output_splits`) to the CPU. The
-  subclass must keep the full tensor and add it to the same DtoH copy (no extra sync).
+  (`num_global_tokens_per_expert`). This is the only global view of the demand in the stock path,
+  and it is counts, not tokens. The stock code kept it as a local variable, and its DtoH copy
+  only brings this rank's row (`input_splits`) and column (`output_splits`) to the CPU. Done
+  (step 4): the parent now stores the tensor, and the subclass adds it to the same DtoH copy (no
+  extra sync).
+- **The count all-gather is a per-layer rendezvous.** It is a collective over TP×EP in every MoE
+  layer, before any dispatch, in both paths. "No barrier" applies between matchings only; this
+  point gives every rank the same `D` and stops straggler effects carrying over between layers.
 - **Buffer layout.** Send chunks are contiguous per destination (`input_splits`). Recv chunks
   placed at `output_splits` offsets reproduce the stock layout, so stock `combine_postprocess`
   works unchanged.

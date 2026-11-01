@@ -4,6 +4,7 @@ import pytest
 from megatron.core.transformer.moe.decomposition import (
     DECOMPOSE_FNS,
     ORDER_FNS,
+    coalesce_chunks,
     greedy_maxweight_decompose,
     order_as_is,
     order_largest_first,
@@ -103,6 +104,21 @@ def test_order_as_is():
     demand = np.zeros((3, 3), dtype=np.int64)
     a, b = np.array([1, 2, 0]), np.array([2, 0, 1])
     assert order_as_is([b, a], demand) == [b, a]
+
+
+@pytest.mark.parametrize(
+    ("counts", "tau", "expected"),
+    [
+        pytest.param([3, 0, 5, 2], 0, [(0, 0), (1, 1), (2, 2), (3, 3)], id="tau0-one-per-chunk"),
+        pytest.param([3, 0, 5, 2], None, [(0, 3)], id="tau-none-one-batch"),
+        pytest.param([3, 0, 5, 2], 4, [(0, 2), (3, 3)], id="tau4-short-tail"),
+        pytest.param([3, 0, 5, 2], 100, [(0, 3)], id="tau-above-total"),
+        pytest.param([0, 0, 0], 1, [(0, 2)], id="all-empty"),
+        pytest.param([], 0, [], id="no-chunks"),
+    ],
+)
+def test_coalesce_chunks(counts, tau, expected):
+    assert coalesce_chunks(counts, tau) == expected
 
 
 def test_registries_match_config_choices():

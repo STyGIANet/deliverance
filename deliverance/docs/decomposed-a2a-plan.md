@@ -259,6 +259,29 @@ python -m torch.distributed.run --nproc-per-node 8 \
   -m pytest -q -p no:cacheprovider tests/unit_tests/transformer/moe/test_decomposed_dispatcher.py -k preprocess
 ```
 
+**Status (2026-10-30): done.**
+
+- **Parent `preprocess()`:** one line stores `num_global_tokens_per_expert` on the instance.
+- **`MoEDecomposedAlltoAllDispatcher._maybe_dtoh_and_synchronize`:** adds that tensor to the stock
+  DtoH copy, on the same side stream, ahead of the stock copies and `d2h_event`, so there is no
+  new sync.
+- **`dispatch_preprocess`:** stock metadata and permute, then the stock wait at
+  `before_ep_alltoall`. Stock does this wait in `token_dispatch()`, which this path never calls;
+  nothing runs between the two points, so the wait does not move. Then `_build_schedule()`.
+- **`_build_schedule()`** produces `demand`, `tokens_per_src_expert`, `schedule`, `send_offsets`,
+  `recv_src`/`recv_counts`/`recv_offsets` (chunk 0 local), `batches` and `batch_of_chunk`.
+- **`coalesce_chunks(counts, tau)`** is in `decomposition.py`.
+
+Tests:
+
+- `test_decomposed_dispatcher.py`: 18 cases on 8 GPUs (E = 1/2/4 local experts × permute fusion
+  on/off × τ = 0/64/None), all passed.
+- `test_decomposition.py`: 37 passed.
+- Regression after the parent change: `test_a2a_token_dispatcher.py` + `test_moe_layer.py` on
+  8 GPUs, 104 passed, 12 skipped.
+- End-to-end: Mixtral, EP=8, the step 2 prompts. The decomposed dispatcher, now building the
+  schedule every forward, gives `generated_tokens` identical to stock.
+
 ## Step 5: `dispatch_compute_combine()` and the forward hook
 
 - `__init__`:

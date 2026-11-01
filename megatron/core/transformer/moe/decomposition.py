@@ -5,7 +5,7 @@ All functions run on the CPU with numpy arrays and are deterministic, so every E
 same schedule from the same demand matrix.
 """
 
-from typing import Callable, Dict, List
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -66,6 +66,33 @@ def order_largest_first(matchings: List[np.ndarray], demand: np.ndarray) -> List
 def order_as_is(matchings: List[np.ndarray], demand: np.ndarray) -> List[np.ndarray]:
     """Keep the decomposition order."""
     return list(matchings)
+
+
+def coalesce_chunks(counts: List[int], tau: Optional[int]) -> List[Tuple[int, int]]:
+    """Group consecutive chunks into compute batches of at least `tau` tokens.
+
+    Args:
+        counts: tokens per chunk, in receive-buffer (schedule) order.
+        tau: coalescing threshold. 0 gives one batch per chunk; None gives one batch for all.
+
+    Returns:
+        Inclusive `(first, last)` chunk-index ranges covering every chunk in order. The last batch
+        may hold fewer than `tau` tokens.
+    """
+    if not counts:
+        return []
+    if tau is None:
+        return [(0, len(counts) - 1)]
+    batches: List[Tuple[int, int]] = []
+    first, total = 0, 0
+    for k, count in enumerate(counts):
+        total += count
+        if total >= tau:
+            batches.append((first, k))
+            first, total = k + 1, 0
+    if first < len(counts):
+        batches.append((first, len(counts) - 1))
+    return batches
 
 
 DECOMPOSE_FNS: Dict[str, Callable[[np.ndarray], List[np.ndarray]]] = {

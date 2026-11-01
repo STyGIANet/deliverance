@@ -6,6 +6,7 @@ import warnings
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple
 
+import numpy as np
 import torch
 
 from megatron.core import utils
@@ -20,6 +21,7 @@ from megatron.core.tensor_parallel import (
     reduce_scatter_to_sequence_parallel_region,
 )
 from megatron.core.transformer.enums import CudaGraphModule
+from megatron.core.transformer.moe.decomposition import DECOMPOSE_FNS, ORDER_FNS, coalesce_chunks
 from megatron.core.transformer.moe.fused_a2a import (
     HYBRIDEP_TOKEN_ALIGNMENT,
     alloc_ep_symm_buffer,
@@ -574,6 +576,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 .reshape(self.ep_size, self.tp_size, self.num_experts)
                 .transpose(0, 1)
             )
+            # Stored for MoEDecomposedAlltoAllDispatcher, which needs the full demand matrix.
+            self.num_global_tokens_per_expert = num_global_tokens_per_expert
             # [tp_size, ep_size, num_experts] -> [tp_size, ep_size, num_local_experts]
             num_global_tokens_per_local_expert = num_global_tokens_per_expert[
                 :, :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1
@@ -962,23 +966,93 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
 class MoEDecomposedAlltoAllDispatcher(MoEAlltoAllTokenDispatcher):
     def __init__(
-            self, num_local_experts: int, 
-            local_expert_indices: List[int], 
-            config: TransformerConfig, 
-            pg_collection: ProcessGroupCollection | None = None
-        ) -> None:
+        self,
+        num_local_experts: int,
+        local_expert_indices: List[int],
+        config: TransformerConfig,
+        pg_collection: ProcessGroupCollection | None = None,
+    ) -> None:
 
-        super().__init__(
-            num_local_experts, 
-            local_expert_indices, 
-            config, 
-            pg_collection
-        )
+        super().__init__(num_local_experts, local_expert_indices, config, pg_collection)
 
         # Our initialisations
         # s_disp = torch.cuda.stream(device="cuda")
-        
-        
+        assert self.tp_size == 1, "decomposed_alltoall requires expert tensor parallel size 1"
+        self.decompose_fn = DECOMPOSE_FNS[config.moe_decomposed_decompose]
+        self.order_fn = ORDER_FNS[config.moe_decomposed_order]
+        self.coalesce_tokens = config.moe_decomposed_coalesce_tokens
+
+        # Per-forward schedule, built on the CPU by _build_schedule(). Receive chunk 0 holds the
+        # local tokens (diagonal, not routed); chunk k >= 1 holds the tokens from the source of
+        # matching k - 1 in self.schedule.
+        self.num_global_tokens_per_expert = None
+        # [ep_size, ep_size]: demand[src, dst] tokens.
+        self.demand = None
+        # [ep_size, num_local_experts]: tokens from each source to each local expert.
+        self.tokens_per_src_expert = None
+        # Matchings (permutations) in issue order: rank i sends to perm[i].
+        self.schedule = None
+        # [ep_size]: offset of each destination's chunk in the permuted input (stock layout).
+        self.send_offsets = None
+        # Per receive chunk: source rank, token count, offset in the receive buffer.
+        self.recv_src = None
+        self.recv_counts = None
+        self.recv_offsets = None
+        # Compute batches as inclusive (first, last) chunk ranges, and the batch of each chunk.
+        self.batches = None
+        self.batch_of_chunk = None
+
+    def _maybe_dtoh_and_synchronize(
+        self, point: str, tokens_per_expert: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """Also move the full token counts to the CPU, within the stock DtoH copy."""
+        if not self.drop_and_pad and point == self.cuda_dtoh_point:
+            on_side_stream = torch.cuda.current_stream() != self.cuda_dtoh_stream
+            if on_side_stream:
+                self.cuda_dtoh_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self.cuda_dtoh_stream):
+                self.num_global_tokens_per_expert = maybe_move_tensor_to_cpu(
+                    self.num_global_tokens_per_expert, as_numpy=True, record_stream=on_side_stream
+                )
+        # The stock copies follow on the same stream, and d2h_event is recorded after them.
+        return super()._maybe_dtoh_and_synchronize(point, tokens_per_expert)
+
+    def dispatch_preprocess(
+        self, hidden_states: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
+    ):
+        """Stock metadata and permutation, then the matching schedule on the CPU."""
+        permutated_local_input_tokens, permuted_probs = super().dispatch_preprocess(
+            hidden_states, routing_map, probs
+        )
+        # The stock path waits for the DtoH copy in token_dispatch(), which this path never calls.
+        self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
+            "before_ep_alltoall", self.tokens_per_expert
+        )
+        self._build_schedule()
+        return permutated_local_input_tokens, permuted_probs
+
+    def _build_schedule(self) -> None:
+        """Decompose the demand matrix and lay out the receive buffer and compute batches."""
+        n, me, num_local = self.ep_size, self.ep_rank, self.num_local_experts
+        # [tp_size=1, ep_size, num_experts] -> [src, dst, local expert]
+        counts = np.asarray(self.num_global_tokens_per_expert, dtype=np.int64).reshape(
+            n, n, num_local
+        )
+        self.demand = counts.sum(axis=-1)
+        self.tokens_per_src_expert = counts[:, me, :]
+        self.schedule = self.order_fn(self.decompose_fn(self.demand), self.demand)
+
+        input_splits = np.asarray(self.input_splits, dtype=np.int64)
+        self.send_offsets = (np.cumsum(input_splits) - input_splits).tolist()
+        self.recv_src = [me] + [int(np.flatnonzero(perm == me)[0]) for perm in self.schedule]
+        self.recv_counts = [int(self.output_splits[src]) for src in self.recv_src]
+        recv_counts = np.asarray(self.recv_counts, dtype=np.int64)
+        self.recv_offsets = (np.cumsum(recv_counts) - recv_counts).tolist()
+        self.batches = coalesce_chunks(self.recv_counts, self.coalesce_tokens)
+        self.batch_of_chunk = [
+            b for b, (first, last) in enumerate(self.batches) for _ in range(first, last + 1)
+        ]
+
 
 class _DispatchManager(ABC):
     """
