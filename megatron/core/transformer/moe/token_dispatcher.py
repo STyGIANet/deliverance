@@ -1039,7 +1039,7 @@ class MoEDecomposedAlltoAllDispatcher(MoEAlltoAllTokenDispatcher):
             n, n, num_local
         )
         self.demand = counts.sum(axis=-1)
-        self.tokens_per_src_expert = counts[:, me, :]
+        self.tokens_per_src_expert = counts[:, me, :] # All tokens this rank receives
         self.schedule = self.order_fn(self.decompose_fn(self.demand), self.demand)
 
         input_splits = np.asarray(self.input_splits, dtype=np.int64)
