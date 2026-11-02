@@ -80,6 +80,23 @@ makespan per layer, which shows where cold start sits. `--csv` writes one row pe
   `--warmup 0` keeps prefill with the cold start included (use p50 or `--per-layer`). Doing a
   warmup `generate` inside `offline_inference.py` would remove this trade-off. Not done yet.
 
+### Plot a timeline
+
+One PNG per (step, layer), one subplot per rank, one lane per CUDA stream: `main`, `dispatch`,
+`compute` and `combine`. The local-chunk copy `dispatch[0]` is drawn on the compute lane, where
+it runs. Needs matplotlib.
+
+```bash
+python deliverance/scripts/plot_moe_timeline.py local/moe-timing/<run> --step 9 --layer 17
+python deliverance/scripts/plot_moe_timeline.py local/moe-timing/<run> --step 0 9 --layer 1 17 \
+  --ranks 0 1 2 3 --zoom -o local/timelines
+```
+
+- `--zoom` crops each rank to its own first-dispatch .. last-combine window.
+- `--xlim` applies one window to every rank, but rank clocks differ.
+- Output goes to `<out-dir>/<prefix>_step<S>_layer<L>.png`. `-o` defaults to the timing
+  directory and `--prefix` to `timeline`.
+
 ### Smoke test (unit tests)
 
 Timer tests on one GPU (about 1 s):

@@ -442,6 +442,55 @@ python deliverance/scripts/analyse_moe_timing.py local/moe-timing/<run> --warmup
 Expected: every row has `schedule_cpu_us` and per-matching intervals, and overlapped > 0.
 Then confirm on one layer with Nsight Systems that the three streams actually overlap.
 
+**Status (2026-11-01): hooks done; overlap NOT achieved yet.**
+
+Hooks:
+
+- `dispatch_compute_combine(..., timing=)` records `dispatch[k]`, `compute[b]` and `combine[k]` on
+  their own streams, with compute and combine starting after their waits.
+- `dispatch[0]` and `combine[0]` are the local copies (the stock all-to-all's self-copy).
+- `schedule_cpu_us` is filled in.
+- End-to-end (Mixtral, EP=8, τ=0): 608 rows per rank and tokens identical to stock.
+
+Finding (step 9 layer 17, decode, 64 tokens per rank):
+
+- **Dispatch** of all 7 matchings ends before `compute[0]` starts.
+- **Compute** runs 8 back-to-back batches of ~660 µs.
+- **Combine** starts only after the last compute batch, so there is no overlap.
+
+Nsight (`local/step7-nsys-20261101-173641`):
+
+- No host sync inside the loop: the only blocking call is the stock DtoH sync, once per layer.
+- The compute stream is **CPU launch-bound**. Its kernels start within ~84 µs (median) of launch,
+  and the GPU runs expert kernels only ~25% of the compute intervals (195 ms of ~800 ms over 2 s).
+  Issuing one `SequentialMLP` call costs about as much CPU time as its GPU work at 64 tokens; τ=0
+  makes 8 calls per layer where stock makes 1.
+- The CPU queues all dispatch, then all compute, then all combine, so combine reaches the GPU
+  only as compute finishes.
+
+Tried: interleaving the issue order (per batch, its expert call followed by its combines). Tests
+passed and tokens matched stock, but there was still no overlap.
+
+Reverted (2026-11-01) to the three loops: all dispatch, then all compute, then all combine,
+each stream gated by events. The combine loop must be queued after the compute loop: a stream
+wait on an event that has not been recorded yet does not wait at all, so `compute_done[b]` has to
+be recorded on the CPU first. Results: 42 dispatcher tests pass.
+
+Measured during the interleaving trial (`local/step7b-nsys-20261101-184633`): the earlier "host
+sync" hypothesis was wrong. In decode the whole path is **CPU-bound**:
+
+- every kernel starts ~10 µs after its launch, so the GPU never has queued work on two streams
+- per batch the CPU spends ~1.1 ms against ~0.6 ms of GPU work:
+  - ~500 µs to issue one `SequentialMLP` call (4 kernels)
+  - ~130 µs per P2P call (`P2POp` lists, coalescing manager, work waits)
+  - timing events and Python in between
+- per layer: 7 dispatch + up to 8 expert + 7 combine calls, against 2 all-to-alls + 1 expert call
+  in stock
+
+Overlap can only appear where GPU work per batch exceeds its CPU issue cost: prefill with many
+tokens (step 8). Host overhead per call (P2P issue, expert-call launch) is a backlog item: it
+bounds τ in decode independently of the GPU knee (Fig. 1).
+
 ## Step 8: End-to-end runs and the comparison
 
 Same settings for both paths (engine prefill settings, CUDA graphs off, same checkpoint), several

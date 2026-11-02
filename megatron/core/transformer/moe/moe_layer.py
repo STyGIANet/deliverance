@@ -764,13 +764,14 @@ class MoELayer(BaseMoELayer):
 
                 if isinstance(self.token_dispatcher, MoEDecomposedAlltoAllDispatcher):
                     # Dispatch, expert compute and combine pipelined per matching on side
-                    # streams (no separate blocking phases). Per-matching timing: step 7.
+                    # streams; timed per matching / batch inside.
                     output = self.token_dispatcher.dispatch_compute_combine(
-                        hidden_states, probs, self.experts
+                        hidden_states, probs, self.experts, timing=timing
                     )
                     mlp_bias = None
                     if timing is not None:
                         timing.n_tokens_recv = sum(self.token_dispatcher.recv_counts)
+                        timing.schedule_cpu_us = self.token_dispatcher.schedule_cpu_us
                 else:
                     with moe_phase(timing, "dispatch") as interval:
                         dispatched_input, probs = self.dispatch(hidden_states, probs)

@@ -449,6 +449,25 @@ SYS (through UPI).
   neighbour, or fall back to stock A2A for the residual.
 - **Intra-matching imbalance (§3.3):** split heavy pairs across consecutive matchings.
 - **Adaptive fallback:** stock A2A when total tokens are small (decode steps, Fig. 3).
+- **Host (CPU) overhead per call.** Measured 2026-11-01: ~130 µs per P2P call and ~500 µs per
+  `SequentialMLP` call. In decode the path is CPU-bound (the GPU runs each kernel as soon as it
+  is launched), so no overlap is possible there. Options:
+  - cheaper P2P issue (prebuilt op lists, fewer Python layers)
+  - a grouped-GEMM expert implementation
+  - fewer timing events
+  - per-shape CUDA graphs of the expert call
+  - the adaptive fallback above
+- **CPU issue order matters as much as stream dependencies.** A stream wait on a CUDA event that
+  has not been recorded yet does not wait at all. So `combine[k]`'s wait on `compute_done[k]` can
+  only be queued after the CPU has queued that record, and combine can never be queued ahead of
+  compute's issue. When issuing compute is CPU-bound (decode), combine reaches the GPU late. The
+  code uses three loops (all dispatch, all compute, all combine); interleaving was tried and gave
+  no overlap in decode either. Ways to queue combine truly up front:
+  - GPU-side flags: `cuStreamWriteValue32` on the compute stream, `cuStreamWaitValue32` on the
+    combine stream. The wait can be queued before the write. Needs the CUDA driver API
+    (cuda-python).
+  - A separate CPU thread that queues each combine once its `compute_done` is recorded. Limited
+    by the GIL.
 - **Decomposition cost:** cache by `D` for repeated decode shapes. Overlap it with permute.
 - **Buffers:** preallocate recv/out buffers across layers.
 - **Shared experts:** overlap with matching-1 dispatch (Mixtral has none; relevant for DeepSeek).

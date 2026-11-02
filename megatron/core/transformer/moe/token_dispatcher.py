@@ -2,6 +2,7 @@
 
 import logging
 import os
+import time
 import warnings
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple
@@ -37,6 +38,7 @@ from megatron.core.transformer.moe.fused_a2a import (
     new_nccl_ep_buffer,
     set_deepep_num_sms,
 )
+from megatron.core.transformer.moe.moe_timing import LayerTimingRecord, moe_phase
 from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
     get_align_size_for_quantization,
@@ -1010,6 +1012,8 @@ class MoEDecomposedAlltoAllDispatcher(MoEAlltoAllTokenDispatcher):
         # Compute batches as inclusive (first, last) chunk ranges, and the batch of each chunk.
         self.batches = None
         self.batch_of_chunk = None
+        # CPU time of the last _build_schedule(), for the MoE phase timer.
+        self.schedule_cpu_us = None
 
         # Global ranks of the EP group, indexed by EP rank (the src/dst indices of the schedule).
         self.ep_global_ranks = torch.distributed.get_process_group_ranks(self.ep_group)
@@ -1100,6 +1104,12 @@ class MoEDecomposedAlltoAllDispatcher(MoEAlltoAllTokenDispatcher):
 
     def _build_schedule(self) -> None:
         """Decompose the demand matrix and lay out the receive buffer and compute batches."""
+        start = time.perf_counter()
+        self._build_schedule_impl()
+        # CPU time; the GPU sits idle for it between the DtoH sync and the first P2P.
+        self.schedule_cpu_us = (time.perf_counter() - start) * 1e6
+
+    def _build_schedule_impl(self) -> None:
         n, me, num_local = self.ep_size, self.ep_rank, self.num_local_experts
         # [tp_size=1, ep_size, num_experts] -> [src, dst, local expert]
         counts = np.asarray(self.num_global_tokens_per_expert, dtype=np.int64).reshape(
@@ -1183,7 +1193,11 @@ class MoEDecomposedAlltoAllDispatcher(MoEAlltoAllTokenDispatcher):
         return output
 
     def dispatch_compute_combine(
-        self, permuted_tokens: torch.Tensor, permuted_probs: torch.Tensor, experts
+        self,
+        permuted_tokens: torch.Tensor,
+        permuted_probs: torch.Tensor,
+        experts,
+        timing: Optional[LayerTimingRecord] = None,
     ) -> torch.Tensor:
         """Dispatch, expert compute and combine, pipelined over the matchings.
 
@@ -1194,6 +1208,10 @@ class MoEDecomposedAlltoAllDispatcher(MoEAlltoAllTokenDispatcher):
         Args:
             permuted_tokens, permuted_probs: output of dispatch_preprocess (stock layout).
             experts: the layer's expert module.
+            timing: MoE phase timing record, if timing is on. Each interval is recorded on the
+                stream doing the work, and compute/combine intervals start only after that
+                stream's wait, so they do not include idle time. dispatch[0] and combine[0] are
+                the local chunk's copies (the stock all-to-all's self-copy).
 
         Returns:
             Combined expert outputs in the stock layout, for combine_postprocess().
@@ -1222,27 +1240,37 @@ class MoEDecomposedAlltoAllDispatcher(MoEAlltoAllTokenDispatcher):
                 dst, src = int(perm[me]), self.recv_src[k]
                 send = self._send_slice(dst)
                 recv = self._chunk_slice(k)
-                self._p2p(
-                    self.dispatch_group,
-                    sends=(
-                        [(dst, (permuted_tokens[send], permuted_probs[send]))]
-                        if send.stop > send.start
-                        else []
-                    ),
-                    recvs=(
-                        [(src, (recv_tokens[recv], recv_probs[recv]))]
-                        if recv.stop > recv.start
-                        else []
-                    ),
-                )
+                # Includes waiting for the partners to post (see moe-timing.md).
+                with moe_phase(timing, "dispatch", idx=k, tokens=self.recv_counts[k]):
+                    self._p2p(
+                        self.dispatch_group,
+                        sends=(
+                            [(dst, (permuted_tokens[send], permuted_probs[send]))]
+                            if send.stop > send.start
+                            else []
+                        ),
+                        recvs=(
+                            [(src, (recv_tokens[recv], recv_probs[recv]))]
+                            if recv.stop > recv.start
+                            else []
+                        ),
+                    )
                 dispatch_done[k].record()
+
+        def chunk_output(k):
+            b = self.batch_of_chunk[k]
+            start = self.recv_offsets[k] - self.recv_offsets[self.batches[b][0]]
+            return batch_outputs[b][start : start + self.recv_counts[k]]
+
+        # Chunk 0: local tokens (not routed), copied so batches stay one slice.
+        with torch.cuda.stream(self.compute_stream):
+            local = self._chunk_slice(0)
+            with moe_phase(timing, "dispatch", idx=0, tokens=self.recv_counts[0]):
+                recv_tokens[local].copy_(permuted_tokens[self._send_slice(me)])
+                recv_probs[local].copy_(permuted_probs[self._send_slice(me)])
 
         # Stage 2: expert compute, one call per coalesced batch; empty batches are skipped.
         with torch.cuda.stream(self.compute_stream):
-            # Chunk 0: local tokens (not routed), copied so batches stay one slice.
-            local = self._chunk_slice(0)
-            recv_tokens[local].copy_(permuted_tokens[self._send_slice(me)])
-            recv_probs[local].copy_(permuted_probs[self._send_slice(me)])
             for b, (first, last) in enumerate(self.batches):
                 if last > 0:
                     # The dispatch stream is in order: chunk `last` done => all earlier done.
@@ -1250,31 +1278,32 @@ class MoEDecomposedAlltoAllDispatcher(MoEAlltoAllTokenDispatcher):
                 rows = slice(self.recv_offsets[first], self._chunk_slice(last).stop)
                 if rows.stop > rows.start:
                     counts = self.tokens_per_src_expert[self.recv_src[first : last + 1]]
-                    batch_outputs[b] = self._run_experts(
-                        experts, recv_tokens[rows], recv_probs[rows], counts
-                    )
+                    # Started after the wait above, so it measures compute, not idling.
+                    with moe_phase(timing, "compute", idx=b, tokens=rows.stop - rows.start):
+                        batch_outputs[b] = self._run_experts(
+                            experts, recv_tokens[rows], recv_probs[rows], counts
+                        )
                 compute_done[b].record()  # also when skipped, so combine's waits stay uniform
 
         # Stage 3: combine, the inverse of each matching, in the same order as dispatch.
+        # Queued after stage 2 on the CPU: a stream wait on an event that has not been recorded
+        # yet does not wait at all, so compute_done[b] must be recorded first.
         with torch.cuda.stream(self.combine_stream):
-
-            def chunk_output(k):
-                b = self.batch_of_chunk[k]
-                start = self.recv_offsets[k] - self.recv_offsets[self.batches[b][0]]
-                return batch_outputs[b][start : start + self.recv_counts[k]]
-
             self.combine_stream.wait_event(compute_done[self.batch_of_chunk[0]])
-            if self.recv_counts[0] > 0:
-                out[self._send_slice(me)].copy_(chunk_output(0))
+            with moe_phase(timing, "combine", idx=0, tokens=self.recv_counts[0]):
+                if self.recv_counts[0] > 0:
+                    out[self._send_slice(me)].copy_(chunk_output(0))
             for k, perm in enumerate(self.schedule, start=1):
                 dst, src = int(perm[me]), self.recv_src[k]
                 self.combine_stream.wait_event(compute_done[self.batch_of_chunk[k]])
                 back = self._send_slice(dst)
-                self._p2p(
-                    self.combine_group,
-                    sends=[(src, (chunk_output(k),))] if self.recv_counts[k] > 0 else [],
-                    recvs=[(dst, (out[back],))] if back.stop > back.start else [],
-                )
+                # Started after the wait above; includes waiting for the partners to post.
+                with moe_phase(timing, "combine", idx=k, tokens=back.stop - back.start):
+                    self._p2p(
+                        self.combine_group,
+                        sends=[(src, (chunk_output(k),))] if self.recv_counts[k] > 0 else [],
+                        recvs=[(dst, (out[back],))] if back.stop > back.start else [],
+                    )
 
         # Joining the combine stream joins all three: it waited on the last compute batch, which
         # waited on the last matching's dispatch. Buffers allocated on the side streams stay
